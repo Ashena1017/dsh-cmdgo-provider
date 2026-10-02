@@ -22,8 +22,12 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { isVolatile } from '@deepseek-ai/cosmokit'
 import { assertUsableApiKey, LlmError, resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
 import type { RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
+// 纯类型导入：只为拿到 `loader/volatile-update` 事件与 `fiber.entry` 的类型增强。
+// 它是 dsh 自带的 loader 包，与运行时的 @deepseek-ai/cordis 配套。
+import type {} from '@deepseek-ai/cordis-plugin-loader'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
@@ -32,6 +36,7 @@ import type {} from '@deepseek-ai/dsh-settings'
 import { CommandCodeGoAdapter, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } from './adapter.js'
 import type { CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
 import { applyModalities, fetchAllModels, fetchCatalog, fetchCatalogModalities, hasKnownModality, selectGoModels } from './models.js'
+import type { ModelPricing } from './models.js'
 import { DEFAULT_STUDIO_BASE, CommandCodeLoginManager } from './oauth.js'
 import type { LoginSuccessInfo, LoginStatus } from './oauth.js'
 import { AccountPool } from './pool.js'
@@ -42,8 +47,11 @@ import { CallMeter } from './meter.js'
 import type { MeterSnapshot } from './meter.js'
 import { RequestStats } from './request-stats.js'
 import type { RequestStatsView } from './request-stats.js'
+import { CmdgoPrefs } from './prefs.js'
 import type { GoModel } from './models.js'
 import type { ImageResolver } from './protocol.js'
+import { resolveRequestImageTarget } from './image-target.js'
+import type { ImageRequestTarget } from './image-target.js'
 
 export {
   CommandCodeGoAdapter,
@@ -51,7 +59,8 @@ export {
   DEFAULT_MAX_TOKENS,
 } from './adapter.js'
 export type { CommandCodeGoAdapterOptions, CommandCodeGoConnectionOptions, CommandCodeGoModel } from './adapter.js'
-export { fetchCatalog, fetchCatalogEfforts, fetchGoModels, isGoModel, parseCatalogEfforts, parseCatalogPlans, selectGoModels } from './models.js'
+export { fetchCatalog, fetchCatalogEfforts, fetchGoModels, isGoModel, parseCatalogEfforts, parseCatalogPlans, parseCatalogPricing, selectGoModels } from './models.js'
+export type { ModelPricing } from './models.js'
 export { CommandCodeLoginManager, DEFAULT_STUDIO_BASE } from './oauth.js'
 export type { LoginStatus, LoginSuccessInfo } from './oauth.js'
 export { UsageReader, normalizeUsage, resolvePlan } from './usage.js'
@@ -88,9 +97,6 @@ const DEFAULT_BASE_URL = 'https://api.commandcode.ai'
 /** 目录扫描周期；模型列表稳定，慢轮询足够。 */
 const REFRESH_MS = 15 * 60 * 1000
 
-/** 请求图像投影预算（与 dsh 内置 provider 同量级：0.64 MP / 1 MiB）。 */
-const DEFAULT_REQUEST_IMAGE_PIXELS = 640_000
-const DEFAULT_REQUEST_IMAGE_BYTES = 1024 * 1024
 /** 实时模态注册表最多多久重拉一次（2.5 MB，只在目录出现未知模型时才拉）。 */
 const MODALITY_REFRESH_MS = 6 * 60 * 60 * 1000
 
@@ -110,7 +116,7 @@ interface ImageAttachmentRefLike {
 interface ImageAttachmentService {
   readImageRequest(
     ref: ImageAttachmentRefLike,
-    policy: { maxPixels: number; maxBytes: number },
+    target: ImageRequestTarget,
     signal: AbortSignal | undefined,
   ): Promise<{ data: Uint8Array; mediaType: string }>
 }
@@ -167,7 +173,10 @@ export function browserTrustRejection(
 }
 
 /**
- * 插件配置：同时作为 Models 页里该供应商的设置区块形状。
+ * 插件配置的**普通值**形状：`resolveAdapterOptions` 与内部代码用的，就是这里的裸值。
+ *
+ * 注意 dsh 0.1.7 交给 `apply` 的已验证配置不是这个形状：每个 volatile 字段是
+ * 稳定引用（`{ get() }`），所以读之前要先过 `plainOptions()`。
  */
 export interface Config {
   /** 凭据引用，按请求解析；默认 `COMMANDCODE_API_KEY`。 */
@@ -182,30 +191,57 @@ export interface Config {
   retryPolicy?: RetryPolicyConfig
 }
 
-export const Config: z<Config> = z.object({
-  apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV),
-  baseURL: z.string().default(DEFAULT_BASE_URL),
-  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
-  defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
-  retryPolicy: RetryPolicySchema,
-})
+/**
+ * 插件配置 schema：同时作为该供应商在设置页里的表单形状。
+ *
+ * dsh 0.1.7 起 settings 改为「投影 Loader 配置」：字段必须带 `.volatile()`，
+ * loader 才会把它包成稳定引用（`{ get() }`）并在此后原地更新，设置页也才会
+ * 把它渲染成可编辑表单（见 dsh-settings 的 `volatileForm`）。
+ * 因此 schema 必须从 `@deepseek-ai/schemastery` 导入：裸 `schemastery@3.18.0`
+ * 没有运行时的 `.volatile()`。
+ *
+ * 类型上仍声明为 `z<Config>`（普通值形状）：`.volatile()` 只改变**运行时**的
+ * 解析结果（字段变成 `{ get() }` 引用），而本插件内部一律通过 `plainOptions()`
+ * 先取值再用，所以对外的 `Config` 语义保持不变，调用方无需改动。
+ */
+export const Config = z.object({
+  apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV).volatile(),
+  baseURL: z.string().default(DEFAULT_BASE_URL).volatile(),
+  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS).volatile(),
+  defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW).volatile(),
+  retryPolicy: RetryPolicySchema.volatile(),
+}) as unknown as z<Config>
+
+/**
+ * 取出每个 volatile 引用背后的当前值。
+ *
+ * 必须在读取配置的边界调用一次：0.1.7 的 `config.<field>` 是稳定引用而非普通值，
+ * 直接使用会拿到对象本身（`{ get() }`）而不是配置值。非 volatile 字段原样返回，
+ * 所以同一份 `resolveAdapterOptions` 在旧版运行时也照常工作。
+ */
+function plainOptions(config: Config): Config {
+  return Object.fromEntries(
+    Object.entries(config).map(([key, value]) => [key, isVolatile(value) ? value.get() : value]),
+  ) as Config
+}
 
 /** 从原始配置到已校验连接事实的唯一归一化步骤。 */
 export function resolveAdapterOptions(config: Config, scanned: readonly CommandCodeGoModel[]): CommandCodeGoConnectionOptions {
-  if (config.defaultContextWindow !== undefined
-    && (!Number.isInteger(config.defaultContextWindow) || config.defaultContextWindow <= 0)) {
+  const plain = plainOptions(config)
+  if (plain.defaultContextWindow !== undefined
+    && (!Number.isInteger(plain.defaultContextWindow) || plain.defaultContextWindow <= 0)) {
     throw new Error('cmdgo: defaultContextWindow must be a positive integer')
   }
-  if (config.maxTokens !== undefined && (!Number.isSafeInteger(config.maxTokens) || config.maxTokens <= 0)) {
+  if (plain.maxTokens !== undefined && (!Number.isSafeInteger(plain.maxTokens) || plain.maxTokens <= 0)) {
     throw new Error('cmdgo: maxTokens must be a positive safe integer')
   }
   return {
-    apiKeyEnv: credentialRef(config.apiKeyEnv ?? DEFAULT_API_KEY_ENV),
-    baseURL: config.baseURL ?? DEFAULT_BASE_URL,
-    maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
-    defaultContextWindow: config.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    apiKeyEnv: credentialRef(plain.apiKeyEnv ?? DEFAULT_API_KEY_ENV),
+    baseURL: plain.baseURL ?? DEFAULT_BASE_URL,
+    maxTokens: plain.maxTokens ?? DEFAULT_MAX_TOKENS,
+    defaultContextWindow: plain.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
     models: scanned,
-    retryPolicy: resolveRetryPolicy(config.retryPolicy, 'cmdgo: retryPolicy'),
+    retryPolicy: resolveRetryPolicy(plain.retryPolicy, 'cmdgo: retryPolicy'),
   }
 }
 
@@ -233,6 +269,17 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
   options()
+
+  /**
+   * settings 表单命名空间 = 本插件在 profile 里的 entry id。
+   *
+   * dsh 0.1.5 用的是插件自报的 `NS`（'cmdgo'）；0.1.7 的 settings 改为投影
+   * Loader 配置，表单按 **entry id** 作键（见 dsh-settings 的 `describe()`：
+   * `ns: entry.options.id`）。因此 0.1.7 上必须用 entry id，否则 Models 页
+   * 拿 `settingsNs` 去找配置时找不到（`discoverModels` 会拿不到值）。
+   * 取不到 entry（例如被当作普通函数直接挂载）时退回 NS。
+   */
+  const settingsNs = ctx.fiber?.entry?.options.id ?? NS
 
   const currentRef = (): CredentialRef => options().apiKeyEnv
 
@@ -262,6 +309,13 @@ export function apply(ctx: Context, config: Config): void {
   // --- 请求用量台账：缓存读 / 写按会话聚合，供 HUD 验证缓存亲和（issue #6） ---
   // 纯内存，进程内有效；不落盘、不含凭据。
   const requestStats = new RequestStats()
+
+  // --- 用户偏好：模型可见性（黑名单）+ 会话头部 HUD 开关 ---
+  // 落盘 ~/.dsh/cmdgo-prefs.json。模型开关只影响 profile 里的目录展示，
+  // 不参与请求路由（见 adapter.listModels 注释）。
+  const prefs = new CmdgoPrefs(undefined, (message) => { ctx.logger.info(message) })
+  // 立即加载：listModels() 可能在首个请求就同步读取 hiddenIds。
+  void prefs.ensureLoaded()
 
   /** 取账号的 API key；池账号与主 ref 通用（只用 account.ref）。 */
   const accountKey = async (account: { ref: CredentialRef }): Promise<string | undefined> => {
@@ -406,6 +460,17 @@ export function apply(ctx: Context, config: Config): void {
     cache: RequestStatsView
     /** 最近一次目录同步的错误；为空表示目录已就绪。 */
     catalogError?: string
+    /** 当前**可见**的模型 id（已应用模型开关），供设置页渲染开关列表。 */
+    models: string[]
+    /**
+     * 每个模型的每 100 万 token 费率，按模型 id 索引。
+     *
+     * 只有官方 CLI 目录到货的模型才在表里 —— 拿不到目录时整个字段为空对象，
+     * 设置页据此不显示价格（而不是显示 0）。
+     */
+    pricing: Record<string, ModelPricing>
+    /** 用户偏好：关闭的模型 + HUD 开关。 */
+    prefs: { hiddenModels: string[]; hudEnabled: boolean }
   }> {
     const ref = currentRef()
     const credentials = ctx.get('credentials')
@@ -457,6 +522,15 @@ export function apply(ctx: Context, config: Config): void {
       meter: meter.snapshot(),
       cache: requestStats.view(forSessionId),
       accounts: rows,
+      // 完整目录（含被关闭的）：设置页要能列出隐藏项才能把它们打开。
+      models: scanned.map((model) => model.id),
+      // 费率表：只含官方目录公布过价格的模型。
+      pricing: Object.fromEntries(
+        scanned
+          .filter((model): model is typeof model & { pricing: ModelPricing } => model.pricing !== undefined)
+          .map((model) => [model.id, model.pricing]),
+      ),
+      prefs: prefs.snapshot(),
     }
   }
 
@@ -600,6 +674,45 @@ export function apply(ctx: Context, config: Config): void {
             sendJson(rawRes, 200, { ok: true, removed })
             return
           }
+          // --- 模型开关 ---
+          // 关闭/打开单个模型。语义为黑名单：只有被显式关闭的才进 hidden。
+          if (req.method === 'POST' && action === '/model/toggle') {
+            const body = await readJson(req)
+            const id = typeof body.id === 'string' ? body.id : ''
+            if (id.length === 0) {
+              sendJson(rawRes, 400, { ok: false, error: 'missing id' })
+              return
+            }
+            await prefs.setModelHidden(id, body.hidden === true)
+            // 目录变了要让 Models 页与 composer 立刻重取：replace 会广播
+            // `llm/adapters-updated`，客户端的 catalog.refresh() 随之触发。
+            registration.replace([PROVIDER])
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // 批量关闭当前目录里的全部模型（「全部关闭」）。
+          if (req.method === 'POST' && action === '/model/hide-all') {
+            await readJson(req)
+            await prefs.hideMany(scanned.map((model) => model.id))
+            registration.replace([PROVIDER])
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // 清空黑名单（「全部打开」）。刻意不看当前目录，直接清空所有键。
+          if (req.method === 'POST' && action === '/model/show-all') {
+            await readJson(req)
+            await prefs.clearHidden()
+            registration.replace([PROVIDER])
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // --- 会话头部 HUD 开关 ---
+          if (req.method === 'POST' && action === '/hud/toggle') {
+            const body = await readJson(req)
+            await prefs.setHudEnabled(body.enabled !== false)
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
           sendJson(rawRes, 404, { ok: false, error: `unknown action: ${action}` })
         } catch (error) {
           sendJson(rawRes, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
@@ -622,18 +735,38 @@ export function apply(ctx: Context, config: Config): void {
   }
   // --- 图像输入：把 harness 的附件引用解析成网关要的 data URL ---
   // 附件服务是可选的：没有它时适配器会把图片降级成占位文字，绝不静默丢图。
-  const requestImageEncoding = { maxPixels: DEFAULT_REQUEST_IMAGE_PIXELS, maxBytes: DEFAULT_REQUEST_IMAGE_BYTES }
+  /** 附件服务缺席只该吵一次：它要么全程在，要么全程不在。 */
+  let warnedNoAttachments = false
 
   /** 读取一份附件的请求版本并编码成 `data:<mediaType>;base64,<bytes>`。 */
   const resolveImage: ImageResolver = async (block) => {
     const attachments = ctx.get('attachments') as ImageAttachmentService | undefined
-    if (attachments === undefined) return undefined
-    const projected = await attachments.readImageRequest(
-      block.attachment,
-      requestImageEncoding,
-      undefined,
-    )
-    return `data:${projected.mediaType};base64,${Buffer.from(projected.data).toString('base64')}`
+    if (attachments === undefined) {
+      if (!warnedNoAttachments) {
+        warnedNoAttachments = true
+        ctx.logger.warn('[cmdgo] 附件服务（attachments）不可用，本次会话的图片将降级为占位文字')
+      }
+      return undefined
+    }
+    const { attachmentId, width, height } = block.attachment
+    try {
+      const projected = await attachments.readImageRequest(
+        block.attachment,
+        resolveRequestImageTarget(width, height),
+        undefined,
+      )
+      return `data:${projected.mediaType};base64,${Buffer.from(projected.data).toString('base64')}`
+    } catch (error) {
+      // 必须出声。此前这里（以及 protocol.ts 的 imageParts）静默吞掉异常，
+      // 结果是模型只看到 "[image omitted: … could not be read]"，而真正的原因
+      // —— 例如 target 少传 width/height 被附件服务判为非法引用 —— 完全不可见。
+      ctx.logger.warn(
+        '[cmdgo] 附件 %s 的请求图像生成失败（%s），本轮降级为占位文字',
+        String(attachmentId).slice(0, 23),
+        error instanceof Error ? error.message : String(error),
+      )
+      return undefined
+    }
   }
 
   const adapter = new CommandCodeGoAdapter({
@@ -641,6 +774,8 @@ export function apply(ctx: Context, config: Config): void {
     resolveApiKey,
     resolveImage,
     poolSize: () => Math.max(1, pool.size),
+    // 模型开关：只过滤 listModels() 的目录展示，不影响请求路由。
+    hiddenIds: () => prefs.hiddenIds,
     onKeySuccess: async (apiKey) => {
       const account = await accountForKey(apiKey)
       if (account !== undefined) {
@@ -669,7 +804,7 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
   ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: 'Command Code Go', settingsNs: NS, settingsPath: [] },
+    { provider: PROVIDER, displayName: 'Command Code Go', settingsNs, settingsPath: [] },
   ])
   const registration = ctx.llm.registerAdapter([PROVIDER], adapter)
   let registeredPolicy = options().retryPolicy
@@ -680,15 +815,36 @@ export function apply(ctx: Context, config: Config): void {
     registeredPolicy = policy
   }
 
-  // dsh 0.1.5 起 settings 区块改为服务方法 `ctx.settings.installSection`，
-  // 必须在注入 settings 服务的回调里注册（旧版是顶层函数 installSettingsSection）。
+  // dsh 0.1.7：volatile 字段是**原地更新**的稳定引用——`config` 对象身份不变，
+  // 所以上面按 `raw` 身份做键的缓存永远不会自己失效。loader 提交新值后会向拥有者
+  // fiber 派发 `loader/volatile-update`：在这里丢弃缓存并复检注册事实，
+  // 下一次 `options()` 就会解析出新值，重试策略变更也即时生效。
+  // （0.1.5 没有这个事件；监听未声明的事件名是安全空转。）
+  ctx.on('loader/volatile-update', () => {
+    cache = undefined
+    ensureRegistrationFacts()
+  })
+
+  // dsh 0.1.7 起 settings 从「插件主动 installSection」翻转成「投影 Loader 配置」：
+  // `installSection` 已被删除（`SettingsForms` 上只剩 configure/describe/update/…）。
+  // 新契约下：
+  //   1. 表单字段由 Config 上的 `.volatile()` 声明（见上方 Config）；
+  //   2. `configure({ auto: false })` 把本插件登记进 settings 表单面，并声明
+  //      「已有自定义页面」——本插件的页面由 client.js 注册的 settings.section 提供，
+  //      因此不要让 settings 再自动生成一个重复页面；
+  //   3. 配置变更通过上面的 `loader/volatile-update` 感知，不再有 setSource/onChange。
+  // settings 命名空间见上方 `settingsNs`（0.1.7 上是 entry id）。
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: (source) => {
-        current = source
-      },
-      onChange: ensureRegistrationFacts,
-    })
+    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber))
+    // 兼容 0.1.5：它没有 configure()，只有已被 0.1.7 删除的 installSection。
+    // 在 0.1.7 上这个分支不会进入（installSection 是 undefined）。
+    const legacy = settingsCtx.settings as unknown as { installSection?: (...args: unknown[]) => void }
+    if (typeof legacy.installSection === 'function') {
+      legacy.installSection(ctx, settingsNs, Config, config, {
+        setSource: (source: () => Config) => { current = source },
+        onChange: ensureRegistrationFacts,
+      })
+    }
   })
 
   // --- 模型目录实时同步 ---
@@ -722,16 +878,23 @@ export function apply(ctx: Context, config: Config): void {
     return liveModalities
   }
 
-  /** 把目录条目转成 adapter 视图；effort 可用时一并带上。 */
-  const toScanned = (entries: readonly GoModel[], efforts?: ReadonlyMap<string, string[]>): CommandCodeGoModel[] =>
+  /** 把目录条目转成 adapter 视图；effort / 价格可用时一并带上。 */
+  const toScanned = (
+    entries: readonly GoModel[],
+    efforts?: ReadonlyMap<string, string[]>,
+    pricing?: ReadonlyMap<string, ModelPricing>,
+  ): CommandCodeGoModel[] =>
     entries.map((entry) => {
       const effort = efforts?.get(entry.id)
+      // 价格优先用官方表里的（实时），退回到条目自带的（离线快照）。
+      const rate = pricing?.get(entry.id) ?? entry.pricing
       return {
         id: entry.id,
         name: entry.name,
         contextWindow: entry.contextWindow,
         inputModalities: entry.inputModalities,
         ...(effort === undefined ? {} : { efforts: effort }),
+        ...(rate === undefined ? {} : { pricing: rate }),
       }
     })
 
@@ -789,12 +952,14 @@ export function apply(ctx: Context, config: Config): void {
       throw new Error('no Go models found; keeping the previous catalog')
     }
     publish(toScanned(entries))
-    // effort 与档位来自同一张官方表，一次抓取同时得到两者。
-    // 尽力而为：慢或被墙都不影响已经可用的模型列表。
+    // effort、档位、价格来自同一张官方表，一次抓取同时得到三者。
+    // 尽力而为：慢或被墙都不影响已经可用的模型列表（此时设置页不显示价格，
+    // 而不是显示 0 —— 宁可不显示也不编数字）。
     let efforts: Map<string, string[]> | undefined
+    let pricing: Map<string, ModelPricing> | undefined
     let plans: Map<string, boolean> | undefined
     try {
-      ({ efforts, plans } = await fetchCatalog())
+      ({ efforts, pricing, plans } = await fetchCatalog())
     } catch (error) {
       ctx.logger.warn('[cmdgo] effort catalog scan failed: %s', error instanceof Error ? error.message : String(error))
     }
@@ -807,14 +972,14 @@ export function apply(ctx: Context, config: Config): void {
         ctx.logger.warn('[cmdgo] 官方档位表把所有模型都判为非 Go，沿用静态规则结果')
       } else {
         entries = overlaid
-        publish(toScanned(entries, efforts))
+        publish(toScanned(entries, efforts, pricing))
       }
     } else if (efforts !== undefined) {
-      publish(toScanned(entries, efforts))
+      publish(toScanned(entries, efforts, pricing))
     }
     // 目录出现快照未知的模型时，才补拉实时模态注册表。
     const live = await ensureModalities(entries.map(entry => entry.id))
-    if (live !== undefined) publish(toScanned(applyModalities(entries, live), efforts))
+    if (live !== undefined) publish(toScanned(applyModalities(entries, live), efforts, pricing))
   }
 
   // 首扫失败必须快速重试：设备刚启动时网络往往还没就绪，若沿用 15 分钟周期，

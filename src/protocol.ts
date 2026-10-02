@@ -223,18 +223,74 @@ function serializeAssistant(message: Message, pairing?: ToolPairing): Extract<Cc
   return { role: 'assistant', content: parts }
 }
 
-/** 收集全部工具结果的 toolCallId（含嵌在 tool-result 内容里的）。 */
-function collectToolResultIds(messages: readonly Message[]): Set<string> {
-  const ids = new Set<string>()
+/** 一条工具结果的最小视图（两种 harness 形状归一后的结果）。 */
+interface HarnessToolResult {
+  toolCallId: string
+  content: readonly ContentBlock[]
+  isError: boolean
+}
+
+/**
+ * 旧形状的工具结果块（`content` 里嵌 `tool-result`）。
+ *
+ * `ContentBlockMap` 里没有这个成员，只能结构性地断言；字段一律按「可能缺失、
+ * 可能不是数组」处理 —— 历史消息里这两种情况都真实出现过，直接下标会抛异常
+ * 并带走整轮请求（外层只看到 `stream ended without finish-step`）。
+ */
+interface LegacyToolResultBlock {
+  toolCallId: string
+  content?: unknown
+  isError?: unknown
+}
+
+/**
+ * 遍历一条 harness 消息携带的工具结果。
+ *
+ * **harness 的真实形状是「一条 `role: 'tool'` 的消息 = 一个工具结果」**：
+ * ```js
+ * { role: 'tool', toolCallId, isError, content: [ {type:'text', …} ] }
+ * ```
+ * `toolCallId` 在**消息级**，content 是普通块 —— `dsh-llm` 的 `ContentBlockMap`
+ * 里压根没有 `tool-result` 这种块（只有 text / reasoning / image / file /
+ * tool-call / tool-addition / tool-removal）。
+ *
+ * 早先这里只认 `block.type === 'tool-result'`，于是：
+ * - `resultIds` 恒为空 → `serializeAssistant` 把**每一个**工具调用都判成孤儿丢掉；
+ * - 工具结果里也找不到 `tool-result` 块 → 不产出 `tool` 消息，输出文本被拍平成普通
+ *   `user` 消息。
+ * 结果发出去的对话里，模型**从来没有调用过工具**，工具输出全变成用户说的话。模型因此
+ * 每隔几步就「忘记」自己在干活，只吐一段推理或进度小结就收尾 —— 这就是「干到一半停住、
+ * turn 被记成 completed」。旧形状（content 里嵌 `tool-result` 块）继续兼容。
+ */
+function walkToolResults(message: Message, visit: (result: HarnessToolResult) => void): void {
+  if (message.role === 'tool') {
+    const callId = (message as { toolCallId?: unknown }).toolCallId
+    if (typeof callId === 'string' && callId.length > 0) {
+      visit({
+        toolCallId: callId,
+        content: Array.isArray(message.content) ? message.content : [],
+        isError: (message as { isError?: unknown }).isError === true,
+      })
+      return
+    }
+  }
   const walk = (blocks: readonly ContentBlock[]): void => {
     for (const block of blocks) {
       if (block.type === 'tool-result') {
-        ids.add(block.toolCallId)
-        walk(block.content)
+        const legacy = block as unknown as LegacyToolResultBlock
+        const content = Array.isArray(legacy.content) ? legacy.content as readonly ContentBlock[] : []
+        visit({ toolCallId: legacy.toolCallId, content, isError: legacy.isError === true })
+        walk(content)
       }
     }
   }
-  for (const message of messages) walk(message.content)
+  if (Array.isArray(message.content)) walk(message.content)
+}
+
+/** 收集全部工具结果的 toolCallId（含嵌在 tool-result 内容里的）。 */
+function collectToolResultIds(messages: readonly Message[]): Set<string> {
+  const ids = new Set<string>()
+  for (const message of messages) walkToolResults(message, result => { ids.add(result.toolCallId) })
   return ids
 }
 
@@ -244,11 +300,34 @@ function collectToolCallIds(messages: readonly Message[]): Set<string> {
   const walk = (blocks: readonly ContentBlock[]): void => {
     for (const block of blocks) {
       if (block.type === 'tool-call') ids.add(block.id)
-      else if (block.type === 'tool-result') walk(block.content)
+      else if (block.type === 'tool-result') {
+        const content = (block as unknown as LegacyToolResultBlock).content
+        if (Array.isArray(content)) walk(content as readonly ContentBlock[])
+      }
     }
   }
-  for (const message of messages) walk(message.content)
+  for (const message of messages) {
+    if (Array.isArray(message.content)) walk(message.content)
+  }
   return ids
+}
+
+/** assistant 声明过的工具调用 id → 工具名（工具结果要带上它对应的名字）。 */
+function collectToolCallNames(messages: readonly Message[]): Map<string, string> {
+  const names = new Map<string, string>()
+  const walk = (blocks: readonly ContentBlock[]): void => {
+    for (const block of blocks) {
+      if (block.type === 'tool-call') names.set(block.id, block.name)
+      else if (block.type === 'tool-result') {
+        const content = (block as unknown as LegacyToolResultBlock).content
+        if (Array.isArray(content)) walk(content as readonly ContentBlock[])
+      }
+    }
+  }
+  for (const message of messages) {
+    if (Array.isArray(message.content)) walk(message.content)
+  }
+  return names
 }
 
 const NO_IDS: ReadonlySet<string> = new Set()
@@ -264,12 +343,14 @@ const NO_IDS: ReadonlySet<string> = new Set()
  *
  * - `resultIds`：没有结果的调用直接丢掉（避免 `Tool result is missing`）；
  * - `callIds`：没有对应调用的结果也丢掉（反向孤儿，同样破坏形状）；
+ * - `callNames`：id → 工具名，写进工具结果，别让网关只看到 `unknown`；
  * - `emittedCalls` / `emittedResults`：同一个 id 两侧都只发一次，让双射成立；
  * - `dropIds`：自愈重试时被网关点名「缺结果」的 id，两侧一起丢。
  */
 interface ToolPairing {
   resultIds: ReadonlySet<string>
   callIds: ReadonlySet<string>
+  callNames: ReadonlyMap<string, string>
   dropIds: ReadonlySet<string>
   emittedCalls: Set<string>
   emittedResults: Set<string>
@@ -280,6 +361,7 @@ function pairingFor(messages: readonly Message[], dropIds?: ReadonlySet<string>)
   return {
     resultIds: collectToolResultIds(messages),
     callIds: collectToolCallIds(messages),
+    callNames: collectToolCallNames(messages),
     dropIds: dropIds ?? NO_IDS,
     emittedCalls: new Set(),
     emittedResults: new Set(),
@@ -300,13 +382,27 @@ function safeParseJson(raw: string): unknown {
  * results that survive serialization (`kept`), so an image never rides into the
  * request without the result that carried it.
  */
-function collectImages(blocks: ContentBlock[], kept?: ReadonlySet<ContentBlock>): ImageBlock[] {
+function collectImages(blocks: readonly ContentBlock[], kept?: ReadonlySet<ContentBlock>): ImageBlock[] {
   const found: ImageBlock[] = []
   for (const block of blocks) {
     if (block.type === 'image') found.push(block)
     else if (block.type === 'tool-result' && (kept === undefined || kept.has(block))) {
       found.push(...collectImages(block.content, kept))
     }
+  }
+  return found
+}
+
+/**
+ * 只取消息**顶层**的图片块，不深入工具结果。
+ *
+ * 工具结果里的图片跟着那个结果走（见 serializeUser 的 keptImages）：结果被丢掉时
+ * 图片也必须一起丢，否则会凭空多出一条只含图片的 `user` 消息。
+ */
+function topLevelImages(blocks: readonly ContentBlock[]): ImageBlock[] {
+  const found: ImageBlock[] = []
+  for (const block of blocks) {
+    if (block.type === 'image') found.push(block)
   }
   return found
 }
@@ -325,6 +421,9 @@ async function imageParts(blocks: ImageBlock[], resolveImage?: ImageResolver): P
       try {
         dataUrl = await resolveImage(block)
       } catch (_imageResolutionFailure) {
+        // 降级本身不该把整轮请求带走。失败原因由解析器自己记录
+        // （见 index.ts 的 resolveImage）—— 这里静默，是为了不向纯序列化层
+        // 引入 logger 依赖，不是为了掩盖问题。
         dataUrl = undefined
       }
     }
@@ -347,52 +446,69 @@ async function imageParts(blocks: ImageBlock[], resolveImage?: ImageResolver): P
  *
  * `pairing` 会把「没有对应工具调用的结果」和重复 id 丢掉：网关要求双向配对，
  * 反向孤儿同样会让整轮失败。被丢掉的结果里嵌的图片也一并不发（见 collectImages）。
+ *
+ * 返回的两个部分是**分开**给调用方的：`tool` 必须挤进 assistant 后面那段连续的
+ * tool 结果里，而 `follow` 得等整段发完再发（原因见 buildRequest 的 deferred）。
  */
+interface SerializedUser {
+  /** 本条消息的工具结果（`tool` 角色）；没有工具结果时为 undefined。 */
+  tool?: Extract<CcMessage, { role: 'tool' }>
+  /** 紧随其后的文本/图片（`user` 角色）；都没有时为 undefined。 */
+  follow?: Extract<CcMessage, { role: 'user' }>
+}
+
 async function serializeUser(
   message: Message,
   resolveImage?: ImageResolver,
   pairing?: ToolPairing,
-): Promise<CcMessage[]> {
-  const out: CcMessage[] = []
-  const kept: Array<Extract<ContentBlock, { type: 'tool-result' }>> = []
-  const keptBlocks = new Set<ContentBlock>()
-  for (const block of message.content) {
-    if (block.type !== 'tool-result') continue
+): Promise<SerializedUser> {
+  const isToolMessage = message.role === 'tool'
+  const kept: HarnessToolResult[] = []
+  const keptImages: ImageBlock[] = []
+  walkToolResults(message, (result) => {
     if (pairing !== undefined) {
-      if (pairing.dropIds.has(block.toolCallId)) continue
-      if (!pairing.callIds.has(block.toolCallId)) continue
-      if (pairing.emittedResults.has(block.toolCallId)) continue
-      pairing.emittedResults.add(block.toolCallId)
+      if (pairing.dropIds.has(result.toolCallId)) return
+      if (!pairing.callIds.has(result.toolCallId)) return
+      if (pairing.emittedResults.has(result.toolCallId)) return
+      pairing.emittedResults.add(result.toolCallId)
     }
-    keptBlocks.add(block)
-    kept.push(block)
-  }
+    kept.push(result)
+    // 结果里嵌的图片跟着**这个结果**走，不能因为结果被丢掉而单独发出去。
+    keptImages.push(...collectImages(result.content))
+  })
+  const out: SerializedUser = {}
   if (kept.length > 0) {
-    out.push({
+    out.tool = {
       role: 'tool',
       content: kept.map(result => ({
         type: 'tool-result' as const,
         toolCallId: result.toolCallId,
-        toolName: 'unknown',
+        toolName: pairing?.callNames.get(result.toolCallId) ?? 'unknown',
         output: toolResultOutput(result),
       })),
-    })
+    }
   }
-  const text = flattenText(message.content)
-  const images = await imageParts(collectImages(message.content, keptBlocks), resolveImage)
+  // `role: 'tool'` 的消息，content **就是结果本身的载荷**，已经被上面收进工具结果里了；
+  // 再按顶层正文捞一遍会把它当成用户说的话重复发一次（旧实现就是这么漏的）。
+  const text = isToolMessage ? '' : flattenText(message.content)
+  // 顶层图片 + **保留下来的**工具结果里的图片。被丢掉的结果里的图片不进这个列表。
+  const images = await imageParts([
+    ...(isToolMessage ? [] : topLevelImages(message.content)),
+    ...keptImages,
+  ], resolveImage)
   if (text.length > 0 || images.length > 0) {
     const parts: CcUserPart[] = [
       ...(text.length > 0 ? [{ type: 'text' as const, text }] : []),
       ...images,
     ]
     const single = parts.length === 1 ? parts[0] : undefined
-    out.push({
+    out.follow = {
       role: 'user',
       content: single !== undefined && single.type === 'text' ? single.text : parts,
-    })
+    }
   }
   // 空消息也要占位，否则整轮会塌陷。
-  if (out.length === 0) out.push({ role: 'user', content: '' })
+  if (out.tool === undefined && out.follow === undefined) out.follow = { role: 'user', content: '' }
   return out
 }
 
@@ -425,18 +541,41 @@ export async function buildRequest(
   // 先建立工具调用/结果的双射视图：孤儿调用、孤儿结果、重复 id 都在这里被丢掉
   // （见 ToolPairing 与 issue #5）。
   const pairing = pairingFor(options.messages, repair?.dropToolCallIds)
+  // 工具结果里嵌的图片/文本会顺带生成一条 `user` 消息（见 serializeUser）。它必须
+  // 等**整段工具结果**都发完再发：网关只在「assistant 的 tool-call 后面紧跟同 id 的
+  // tool-result、中间不夹别的角色」时才认配对。夹一条 user 进去，后面那些调用就会
+  // 被判成
+  //   {"type":"error","error":{"type":"server_error",
+  //    "message":"Tool result is missing for tool call …"}}
+  // 适配器只好自愈：把那个调用**连同它的结果**一起丢掉再重发。模型于是看到自己上一轮
+  // 的工具调用凭空消失，经常就此不再调用工具、只吐一段推理然后 stop —— harness 收到
+  // 的 assistant 消息里既没有 text 也没有 tool-call，turn 就被记成 completed，界面像
+  // 卡住了（实测 88 个 turn 里 8 个）。这里把顺序修正到发出前，从根上不触发那次自愈。
+  const deferred: CcMessage[] = []
+  const flushDeferred = (): void => {
+    if (deferred.length > 0) messages.push(...deferred.splice(0, deferred.length))
+  }
   for (const message of options.messages) {
     if (message.role === 'system') {
       system += (system ? '\n\n' : '') + flattenText(message.content)
       continue
     }
     if (message.role === 'assistant') {
+      flushDeferred()
       const serialized = serializeAssistant(message, pairing)
       if (serialized !== undefined) messages.push(serialized)
       continue
     }
-    messages.push(...await serializeUser(message, resolveImage, pairing))
+    const { tool, follow } = await serializeUser(message, resolveImage, pairing)
+    if (tool !== undefined) {
+      messages.push(tool)
+      if (follow !== undefined) deferred.push(follow)
+    } else {
+      flushDeferred()
+      if (follow !== undefined) messages.push(follow)
+    }
   }
+  flushDeferred()
 
   const tools: CcTool[] = (options.tools ?? [])
     .map((tool: ToolSchema) => ({
@@ -486,6 +625,39 @@ export interface CcStreamState {
   finished?: boolean
   /** 本流已发出的工具调用 id → 载荷指纹（去重与唯一化用，见 resolveToolCallId）。 */
   toolCallIds?: Map<string, string>
+  /** 当前打开的 text 块下标：delta 必须落回自己那一块，不能被工具调用挪走。 */
+  textIndex?: number
+  /** 当前打开的 reasoning 块下标。 */
+  reasoningIndex?: number
+  /** 本流已经发出的工具调用数（判断「自称有工具调用却一个都没给」用）。 */
+  toolCallsEmitted?: number
+  /** 终态语义（`stop` / `tool-calls` / `max-tokens` / `error`）。 */
+  finishKind?: string
+  /** 网关原始 finishReason 字符串，原样留档。 */
+  rawFinishReason?: string
+  /**
+   * 正在流式到达的工具调用：网关 id → 它已经占住的块。
+   *
+   * 网关对每次调用先发 `tool-input-start` / `tool-input-delta`* / `tool-input-end`，
+   * 最后才补一条汇总的 `tool-call`。在 start 就占块有两个作用：汇总事件缺席时还能靠
+   * `buffered` 把调用补出来；并且它绝不会和 text/reasoning 抢同一个下标（组装器会把
+   * 落在 text 块上的 tool-call delta **静默丢掉**）。
+   */
+  toolInputs?: Map<string, ToolInputStream>
+}
+
+/** 一次工具调用在流内的落脚点（见 {@link CcStreamState.toolInputs}）。 */
+interface ToolInputStream {
+  /** 该调用占住的块下标。 */
+  index: number
+  /** 发给 harness 的调用 id。 */
+  id: string
+  /** 网关在 tool-input-start 上声明的工具名。 */
+  name: string
+  /** 累积的 `tool-input-delta` 原文。 */
+  buffered: string
+  /** 参数是否已经补发过（保证只发一次，绝不拼接两遍）。 */
+  delivered: boolean
 }
 
 /**
@@ -598,6 +770,35 @@ export function streamErrorCode(event: CcStreamEvent, message: string): string {
   return 'SERVER'
 }
 
+/** 网关事件里的工具调用 id（`tool-call` 用 toolCallId，`tool-input-*` 用 id）。 */
+function eventToolId(event: CcStreamEvent): string {
+  if (typeof event.toolCallId === 'string' && event.toolCallId.length > 0) return event.toolCallId
+  return typeof event.id === 'string' ? event.id : ''
+}
+
+/** 这条 `tool-input-*` 事件属于哪次调用（没登记过就是 undefined）。 */
+function toolInputSlot(state: CcStreamState, event: CcStreamEvent): ToolInputStream | undefined {
+  if (state.toolInputs === undefined) return undefined
+  const declared = eventToolId(event)
+  return declared.length > 0 ? state.toolInputs.get(declared) : undefined
+}
+
+/** 文本是否是一段完整 JSON（兜底补发参数前的最后一道闸）。 */
+function isCompleteJson(text: string): boolean {
+  try {
+    JSON.parse(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 每个内容流各占一个**专属**块下标：delta 永远落回自己那一块。 */
+function allocBlockIndex(state: CcStreamState): number {
+  state.blockIndex += 1
+  return state.blockIndex
+}
+
 /**
  * Translate one gateway stream event into one or more harness StreamChunks.
  * @returns an empty array when the event has no harness representation.
@@ -609,44 +810,108 @@ export function eventToChunks(
   const chunks: StreamChunk[] = []
   switch (event.type) {
     case 'text-start': {
-      chunks.push({ type: 'block-start', index: state.blockIndex, blockType: 'text' })
+      state.textIndex = allocBlockIndex(state)
+      chunks.push({ type: 'block-start', index: state.textIndex, blockType: 'text' })
       break
     }
     case 'text-delta': {
       const text = typeof event.text === 'string' ? event.text : ''
-      if (text.length > 0) {
-        chunks.push({ type: 'text-delta', index: state.blockIndex, text })
+      if (text.length === 0) break
+      // 没有 text-start 也要自己开一块：以前直接用共享的 blockIndex，一旦中间夹过
+      // 工具调用，这段文本会落进 tool-call 块里被组装器**静默丢掉**。
+      if (state.textIndex === undefined) {
+        state.textIndex = allocBlockIndex(state)
+        chunks.push({ type: 'block-start', index: state.textIndex, blockType: 'text' })
       }
+      chunks.push({ type: 'text-delta', index: state.textIndex, text })
       break
     }
     case 'reasoning-start': {
-      chunks.push({ type: 'block-start', index: state.blockIndex, blockType: 'reasoning' })
+      state.reasoningIndex = allocBlockIndex(state)
+      chunks.push({ type: 'block-start', index: state.reasoningIndex, blockType: 'reasoning' })
       break
     }
     case 'reasoning-delta': {
       const text = typeof event.text === 'string' ? event.text : ''
-      if (text.length > 0) {
-        chunks.push({ type: 'reasoning-delta', index: state.blockIndex, text })
+      if (text.length === 0) break
+      if (state.reasoningIndex === undefined) {
+        state.reasoningIndex = allocBlockIndex(state)
+        chunks.push({ type: 'block-start', index: state.reasoningIndex, blockType: 'reasoning' })
       }
+      chunks.push({ type: 'reasoning-delta', index: state.reasoningIndex, text })
+      break
+    }
+    // 网关把每次工具调用先以 tool-input-start → tool-input-delta* → tool-input-end
+    // 流式吐出来，最后再补一条**汇总**的 tool-call。以前只认那条汇总事件，于是汇总
+    // 事件一旦缺席，参数已经完整收到的调用会凭空消失。现在在 start 就占住块，顺便
+    // 保证它绝不会和 text/reasoning 抢同一个下标。
+    case 'tool-input-start': {
+      const declared = eventToolId(event)
+      const name = typeof event.toolName === 'string' ? event.toolName : ''
+      const index = allocBlockIndex(state)
+      const id = declared.length > 0 ? declared : `call-${index}`
+      const inputs = state.toolInputs ?? (state.toolInputs = new Map<string, ToolInputStream>())
+      inputs.set(declared.length > 0 ? declared : id, { index, id, name, buffered: '', delivered: false })
+      chunks.push({ type: 'block-start', index, blockType: 'tool-call' })
+      chunks.push({
+        type: 'tool-call-delta',
+        index,
+        id: id as ToolCallChunkId,
+        ...name.length > 0 ? { name } : {},
+        argumentsDelta: '',
+      })
+      state.toolCallsEmitted = (state.toolCallsEmitted ?? 0) + 1
+      break
+    }
+    case 'tool-input-delta': {
+      const slot = toolInputSlot(state, event)
+      if (slot === undefined) break
+      slot.buffered += typeof event.delta === 'string' ? event.delta
+        : typeof event.inputTextDelta === 'string' ? event.inputTextDelta : ''
+      break
+    }
+    // 参数先攒着不发：汇总的 tool-call 才是权威值，只有它缺席时才在终态补发。
+    case 'tool-input-end': {
       break
     }
     case 'tool-call': {
       const input = event.input ?? event.args ?? event.arguments
-      const declared = typeof event.toolCallId === 'string' ? event.toolCallId
-        : typeof event.id === 'string' ? event.id
-          : ''
+      const declared = eventToolId(event)
       const name = typeof event.toolName === 'string' ? event.toolName : ''
       const argumentsDelta = JSON.stringify(input ?? {})
+      // 这次调用已经由 tool-input-start 占好块：只补参数，绝不再开第二个块——同一个
+      // 调用长出两块，网关随后就判「缺结果」。
+      const slot = declared.length > 0 ? state.toolInputs?.get(declared) : undefined
+      if (slot !== undefined) {
+        if (!slot.delivered) {
+          const slotName = slot.name.length > 0 ? slot.name : name
+          chunks.push({
+            type: 'tool-call-delta',
+            index: slot.index,
+            id: slot.id as ToolCallChunkId,
+            ...slotName.length > 0 ? { name: slotName } : {},
+            argumentsDelta,
+          })
+          slot.delivered = true
+          state.toolCallsEmitted = (state.toolCallsEmitted ?? 0) + 1
+        }
+        break
+      }
+      const index = allocBlockIndex(state)
+      // 先占下标再定 id：缺 id 时的兜底 `call-<块下标>` 才和 tool-input-start 那条
+      // 路径同形。重复投递会白占一个下标，但下标只求唯一，留空洞无妨。
       const id = resolveToolCallId(state, declared, `${name}\u0000${argumentsDelta}`)
       // undefined = 同一个调用的重复投递，丢掉（见 resolveToolCallId）。
       if (id === undefined) break
+      chunks.push({ type: 'block-start', index, blockType: 'tool-call' })
       chunks.push({
         type: 'tool-call-delta',
-        index: state.blockIndex,
+        index,
         id: id as ToolCallChunkId,
         ...name.length > 0 ? { name } : {},
         argumentsDelta,
       })
+      state.toolCallsEmitted = (state.toolCallsEmitted ?? 0) + 1
       break
     }
     // finish-step 是每个 step 的终态；finish 是整条流的终态。正常情况两者都到，
@@ -656,10 +921,31 @@ export function eventToChunks(
     case 'finish': {
       if (state.finished === true) break
       state.finished = true
+      // 兜底：走了 tool-input-* 却始终没等到汇总的 tool-call 时，用攒下的参数把这次
+      // 调用补出来。宁可让工具拿到一份非法参数（模型会看到 INVALID_ARGS 并自我纠正），
+      // 也不要让这次调用凭空消失——那正是「turn 记成 completed、界面像卡住」的成因。
+      if (state.toolInputs !== undefined) {
+        for (const slot of state.toolInputs.values()) {
+          if (slot.delivered || slot.buffered.length === 0 || !isCompleteJson(slot.buffered)) continue
+          chunks.push({
+            type: 'tool-call-delta',
+            index: slot.index,
+            id: slot.id as ToolCallChunkId,
+            ...slot.name.length > 0 ? { name: slot.name } : {},
+            argumentsDelta: slot.buffered,
+          })
+          slot.delivered = true
+        }
+      }
+      state.toolCallsEmitted = (state.toolCallsEmitted ?? 0) + chunks.filter(chunk => chunk.type === 'tool-call-delta').length
       const usage = usageSummary(event)
       if (usage !== undefined) chunks.push({ type: 'usage', usage })
       const reason = event.finishReason ?? event.rawFinishReason ?? 'stop'
-      chunks.push({ type: 'finish', reason: mapFinishReason(reason) })
+      const mapped = mapFinishReason(reason)
+      // 记下终态语义，供适配器判断「自称有工具调用却一个都没给」的自相矛盾流。
+      state.finishKind = mapped.kind
+      state.rawFinishReason = typeof reason === 'string' ? reason : undefined
+      chunks.push({ type: 'finish', reason: mapped })
       break
     }
     // error / abort 由适配器转成 LlmError（要带上真实原因），这里不产出 chunk。
