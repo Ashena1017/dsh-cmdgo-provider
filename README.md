@@ -2,6 +2,28 @@
 
 CommandCode **Go 套餐**（$1/mo）供应商插件：把只能用 `cmd` CLI 的 Go 订阅接入 DSH 模型列表，并把 `cmd login` 的 OAuth 登录提取成设置页里的专用登录选项。
 
+> ### 这是个人 fork
+>
+> 本仓库是 [Ajwyunsx/dsh-cmdgo-provider](https://github.com/Ajwyunsx/dsh-cmdgo-provider)
+> 的 fork，基线 `6b74ff5`（v0.9.1）。**上游那个项目才是权威来源**——协议实现、多账号池、
+> 额度显示、调用计量、请求自愈等主体能力都是上游写的，本 fork 只是在其之上补了自己要用的
+> 几处。遇到问题请先对照上游 README，判断是不是上游行为。
+>
+> 本 fork 相对上游的改动（集中在客户端展示层与 dsh 版本适配，**协议实现未动**）：
+>
+> | 改动 | 为什么 |
+> | --- | --- |
+> | 额度胶囊换位置 | 从会话头部右侧移到**模型选择器左侧**，且只在选中本插件模型时显示——用别的模型时它没有意义，不该占着那个位置 |
+> | 模型目录搜索与厂家筛选 | 目录实测 74 个模型，逐个开关太费劲；厂家别名必须归并，否则按厂家筛会漏掉一半 |
+> | 设置页跟随深浅色主题 | 原先写死浅色，深色主题下是一整块白斑；浅色用像素比对守住「逐像素不变」 |
+> | 额度行字号与列宽 | 钱是主角，剩余额度提到 14px；定宽列宽是量出来的（小于内容会折行，比溢出更难看） |
+> | 适配 dsh 0.1.7 / 0.2.x | 上游 peer 范围写死 `<0.2.0`，在 0.2.x 上装不上；实测 0.2.0 对用到的宿主 API 逐字节未变 |
+> | 图像请求几何 | `readImageRequest` 要的是绝对宽高，缺了会被附件服务拒掉，图片**静默**降级成占位文字 |
+>
+> 各项的实测依据与取舍写在正文对应章节里；本 fork 的 README 比上游多出
+> 「[模型目录的搜索与筛选](#模型目录的搜索与筛选)」与
+> 「[设置页跟随深浅色主题](#设置页跟随深浅色主题)」两节。
+
 ## 背景
 
 Command Code 的订阅分两种：
@@ -14,17 +36,25 @@ Command Code 的订阅分两种：
 ## 安装
 
 ```sh
-# npm（推荐）
-dsh plugin add dsh-cmdgo-provider
+# 本 fork（推荐）—— 从 GitHub 装
+dsh plugin add github:Ashena1017/dsh-cmdgo-provider
 
-# 或从 GitHub 安装
-dsh plugin add github:Ajwyunsx/dsh-cmdgo-provider
+# 上游 npm 发布版（不含本 fork 的改动）
+dsh plugin add dsh-cmdgo-provider
 ```
+
+⚠️ npm 上的 `dsh-cmdgo-provider` 是**上游发布的包**（当前 0.9.1），里面**没有**本 fork
+的改动；要本 fork 的行为就用上面那条 GitHub 安装。
 
 安装写入 profile 的依赖与 bundles 列表，**重启 harness 后由 bundles 正常装配**。装完：
 
 1. 「Models」页选择 **Command Code Go** 供应商及模型；
 2. 「设置 → CommandCode Go」生成登录地址，浏览器授权后回调自动写入凭据。
+
+> 本 fork 的版本号带 `-dsh020.N` 后缀（当前 `0.9.1-dsh020.2`），用来和上游的 `0.9.1`
+> 区分——看到这个后缀就说明装的是本 fork。适配记录见
+> [`DSH-0.2.0-适配说明.md`](DSH-0.2.0-适配说明.md) 与
+> [`DSH-0.1.7-适配说明.md`](DSH-0.1.7-适配说明.md)。
 
 ## 功能
 
@@ -499,3 +529,9 @@ DSH 运行期间打开一个恶意页面，它就能静默调用：
 - **回调收不到**：回调服务器绑定在宿主 `127.0.0.1:5959..5968`；若浏览器与宿主不同机，需保证 `localhost:<port>` 能回到宿主（端口转发/SSH 隧道）。
 
 > 非官方插件，仅限个人使用；请遵守 Command Code 服务条款。
+
+---
+
+本仓库是 [Ajwyunsx/dsh-cmdgo-provider](https://github.com/Ajwyunsx/dsh-cmdgo-provider)
+的个人 fork（基线 `6b74ff5`，v0.9.1），沿用上游的 MIT 许可。协议实现、多账号池、
+额度显示、调用计量、请求形状自愈等主体能力均出自上游，特此致谢；本 fork 的增量见文首那张表。
