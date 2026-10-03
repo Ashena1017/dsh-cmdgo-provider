@@ -1,6 +1,6 @@
 {
   "name": "dsh-cmdgo-provider",
-  "version": "0.9.1-dsh017.3",
+  "version": "0.9.1-dsh020.2",
   "description": "CommandCode Go 套餐供应商：/alpha/generate CLI 网关（官方 CLI 指纹伪装）接入 DSH 模型列表 + OAuth 登录（多账号池轮询/故障转移）+ 每账号 5 小时/周/月额度显示 + 模型目录的搜索与厂家筛选（厂家别名归并，批量开关跟随筛选范围）+ 跟随宿主深浅色主题（深色下不再是白斑）+ 模型选择器左侧的订阅额度胶囊（仅选中本插件模型时显示；全部账号合计 + 实测平均单次消耗推算的理论调用次数 + 会话级缓存读/写与命中率台账）+ 视觉模型多模态（图像输入）+ 工具调用双射与请求形状自愈 —— 本地 fork，支持 dsh 0.1.7-rc.1 ~ 0.2.x（0.1.7 是 settings 破坏性更新：改为投影 Loader 配置，需 configure + volatile 表单；0.2.x 对插件用到的宿主 API 逐字节未变），实测运行 dsh 0.2.0-rc.2",
   "type": "module",
   "main": "./lib/index.js",
