@@ -42,7 +42,12 @@ const inlined = client.slice(at, to)
 
 console.log('[2] 内联块与 lib/hud-template.js 同步')
 // 用与内联脚本相同的规则重算一遍，逐字节比对。
-const body = compiled
+// ⚠️ 两侧都先归一化成 LF：仓库 autocrlf=true，工作区文件是 CRLF，而 client.js
+// 里的内联块是 LF（提交时规范化的）。不归一化就会拿苹果比橘子 —— 而且报错
+// 只说「字节数不一致」，看不出是换行符差异。这与 inline-hud-template.mjs
+// 的处理保持一致（那边也必须先归一化，否则 `*\/\n` 匹配不到 CRLF 的文件头）。
+const norm = (s) => s.replace(/\r\n/g, '\n')
+const body = norm(compiled)
   .replace(/^\/\*\*[\s\S]*?\*\/\n/, '')
   .replace(/^export function /gm, 'function ')
   .replace(/^export const /gm, 'const ')
@@ -54,14 +59,30 @@ const expected = [
   ...body.split('\n').map((line) => (line.length > 0 ? '    ' + line : line)),
   END,
 ].join('\n')
+const inlinedNorm = norm(inlined)
 check('逐字节一致（不一致 → 忘了重跑 scripts/inline-hud-template.mjs）',
-  inlined === expected,
-  'inlined ' + inlined.length + ' 字节 vs expected ' + expected.length + ' 字节')
+  inlinedNorm === expected,
+  'inlined ' + inlinedNorm.length + ' 字节 vs expected ' + expected.length + ' 字节')
 
 console.log('[3] client.js 只内联了一次（重复注入会让后一份覆盖前一份）')
 check('renderHudTemplate 在 client.js 里只定义一次',
   (client.match(/function renderHudTemplate/g) || []).length === 1,
   'got ' + (client.match(/function renderHudTemplate/g) || []).length)
+
+/* 内联块里不能带 lib/hud-template.js 的**文件头注释**。
+ *
+ * 这条单独钉，是因为上面那条「逐字节一致」在 CRLF 下曾经假通过：正则
+ * `*\/\n` 匹配不到 `*\/\r\n`，文件头注释留了下来，而比对两侧用了同一套
+ * 有 bug 的规则，于是两边一致、测试却绿。现在比对前统一归一化，但**仍然
+ * 要独立断言「注释没混进来」** —— 否则将来若有人再引入同类换行假设，
+ * 两侧同时出错仍会互相掩盖。 */
+const headerLine = '胶囊文字的**受限模板引擎**'
+check('内联块里没有 lib/hud-template.js 的文件头注释',
+  !inlined.includes(headerLine), '内联块里混进了文件头注释')
+/* 反向：确认这段注释确实存在于编译产物里 —— 否则上面的断言可能因为
+ * 注释被改名而永远通过（那就不再是门禁）。 */
+check('（前提）编译产物里确实有那段文件头注释',
+  norm(compiled).includes(headerLine), '编译产物里找不到，说明断言已失效')
 
 console.log('[4] 抠出来的那份与 ESM 版行为一致')
 // 把内联块包成一个可导入的模块，用同一批用例对拍。

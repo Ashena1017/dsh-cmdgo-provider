@@ -21,7 +21,6 @@ const BEGIN = '    /* ==== BEGIN hud-template（由 scripts/inline-hud-template.
 const END = '    /* ==== END hud-template ==== */'
 
 const source = readFileSync(join(root, 'src', 'hud-template.ts'), 'utf8')
-const compiled = readFileSync(join(root, 'lib', 'hud-template.js'), 'utf8')
 
 /**
  * 从 TS 源码里抠出实现，去掉类型标注。
@@ -29,7 +28,17 @@ const compiled = readFileSync(join(root, 'lib', 'hud-template.js'), 'utf8')
  * 为什么不用 lib/hud-template.js（已经是 JS）？因为那份带 `export` 关键字，
  * 而且会被 tsc 重新生成；从 TS 源抠可以保证注释也一起带过去。
  * 但去类型标注靠正则不可靠 —— 所以实际取的是**编译产物**，只剥 export。
+ *
+ * ⚠️ 先把 CRLF 归一化成 LF 再处理。仓库是 `core.autocrlf=true`，工作区里的
+ * `lib/hud-template.js` 是 CRLF，而提交里的 blob 是 LF —— 同一个文件在两种
+ * 状态下内容不同。下面所有正则都以 `\n` 结尾（`*\/\n`、`^export ...`），
+ * CRLF 下 `*\/` 后面跟的是 `\r\n`，`*\/\n` 匹配不到，文件头注释就会**留下来**，
+ * 生成的内联块比预期多一整段注释。这个 bug 只在「tsc 刚重编译过、文件变回
+ * CRLF」时暴露：`git diff` 因 autocrlf 规范化而显示为空，但 smoke 读的是
+ * 原始字节，于是报「逐字节不一致」却看不出差在哪。
  */
+const compiledRaw = readFileSync(join(root, 'lib', 'hud-template.js'), 'utf8')
+const compiled = compiledRaw.replace(/\r\n/g, '\n')
 const body = compiled
   .replace(/^\/\*\*[\s\S]*?\*\/\n/, '')            // 去掉文件头注释（client.js 里有对应说明）
   .replace(/^export function /gm, 'function ')     // export function → function
