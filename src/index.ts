@@ -587,7 +587,7 @@ export function apply(ctx: Context, config: Config): void {
      */
     pricing: Record<string, ModelPricing>
     /** 用户偏好：关闭的模型 + HUD 开关 + 设置页配色方案。 */
-    prefs: { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference; hudPosition: CmdgoHudPosition }
+    prefs: { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference; hudPosition: CmdgoHudPosition; hudTemplate: string }
   }> {
     const ref = currentRef()
     const credentials = ctx.get('credentials')
@@ -850,12 +850,30 @@ export function apply(ctx: Context, config: Config): void {
           // 与 /theme/set 同样只存偏好；真正的槽位切换在客户端做（两个槽都注册，
           // 由偏好决定渲染哪一个，而不是动态 register/unregister —— 后者在宿主
           // 重启前不会生效，用户会以为没点上）。
-          if (req.method === 'POST' && action === '/hud/position') {            const body = await readJson(req)
+          if (req.method === 'POST' && action === '/hud/position') {
+            const body = await readJson(req)
             if (!isCmdgoHudPosition(body.position)) {
               sendJson(rawRes, 400, { ok: false, error: 'invalid position' })
               return
             }
             await prefs.setHudPosition(body.position)
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // --- 订阅胶囊的自定义文字模板 ---
+          // 只存字符串，**不在这里校验语法**：语法错误要出现在设置页的编辑器旁边
+          // （用户正在打字时就要看见红线），而不是写入被 400 拒掉。渲染层
+          // `hud-template.ts` 负责解析并在返回值里带上 error / unknown。
+          //
+          // 另：模板**不是**可执行表达式。它由受限占位符语法解析，只能读白名单
+          // 变量与 min/max 聚合，永远不经过 eval —— 详见 hud-template.ts 的说明。
+          if (req.method === 'POST' && action === '/hud/template') {
+            const body = await readJson(req)
+            if (typeof body.template !== 'string') {
+              sendJson(rawRes, 400, { ok: false, error: 'invalid template' })
+              return
+            }
+            await prefs.setHudTemplate(body.template)
             sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
             return
           }

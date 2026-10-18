@@ -54,6 +54,15 @@ done
 echo "[build] dsh-cmdgo-provider — tsc host -> lib/"
 node "$TSC" -p "$PKG_DIR/tsconfig.json"
 
+# 模板引擎要内联进 client.js（它没有模块系统，不能 import ESM）。
+# 放在 tsc 之后：内联的正是刚编出来的 lib/hud-template.js，两侧不能各改一份。
+node "$PKG_DIR/scripts/inline-hud-template.mjs"
+
+# 顺带做一致性校验：内联块必须存在，否则 client.js 会在运行时报
+# "renderHudTemplate is not defined"（构建期发现比运行时发现便宜得多）。
+node "$PKG_DIR/scripts/inline-hud-template.mjs" --check \
+  | grep -q '^\[ok\]' || { echo "ERROR: hud-template 未内联进 lib/client.js" >&2; exit 1; }
+
 # client.js 是手写的 __ModuleLoader__ bundle，不参与 tsc；确保在 lib/
 [ -f "$PKG_DIR/lib/client.js" ] || { echo "ERROR: lib/client.js missing" >&2; exit 1; }
 echo "[build] done: lib/index.js + lib/client.js"

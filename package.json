@@ -22,8 +22,9 @@
   ],
   "scripts": {
     "build": "bash scripts/build.sh",
+    "inline:hud-template": "node scripts/inline-hud-template.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "smoke": "node scripts/smoke-protocol.mjs && node scripts/smoke-repair.mjs && node scripts/smoke-go-plan.mjs && node scripts/smoke-request-stats.mjs && node scripts/smoke-meter.mjs && node scripts/smoke-client.mjs && node scripts/smoke-empty-turn.mjs && node scripts/smoke-settings.mjs && node scripts/smoke-settings-projection.mjs && node scripts/smoke-image-target.mjs"
+    "smoke": "node scripts/smoke-protocol.mjs && node scripts/smoke-repair.mjs && node scripts/smoke-go-plan.mjs && node scripts/smoke-request-stats.mjs && node scripts/smoke-meter.mjs && node scripts/smoke-hud-template.mjs && node scripts/smoke-hud-template-inline.mjs && node scripts/smoke-hud-template-route.mjs && node scripts/smoke-client.mjs && node scripts/smoke-empty-turn.mjs && node scripts/smoke-settings.mjs && node scripts/smoke-settings-projection.mjs && node scripts/smoke-image-target.mjs"
   },
   "keywords": [
     "dsh",

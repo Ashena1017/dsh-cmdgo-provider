@@ -104,6 +104,43 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
     任何 id，若不加 `disabled` 就会叠进新的单行请求，落盘顺序和点击顺序不一致；
     同时 `toggleModel` 用 `inflightModels` 做同步去重（`modelBusy` 是 state，
     快速双击时第二次点击在它生效前就进来了）。
+15. **胶囊模板永远不能执行用户代码**：模板来自设置页文本框（也能被直接改
+    `~/.dsh/cmdgo-prefs.json`），用 `eval` / `new Function` 跑它就等于开了一条
+    在这颗胶囊上下文里执行任意 JS 的通道。所以 `src/hud-template.ts` 是**只读白名单**
+    解析：变量查表 + `min`/`max` 聚合，没有副作用、没有分支循环、读不到表外的东西。
+    `scripts/smoke-hud-template.mjs` 的 `[6]` 节固定了一批注入尝试
+    （`constructor` / `process` / `require(...)` / 构造器链），它们全部必须被拒。
+16. **模板语法错误要在渲染层回报，不在写盘层拦**：服务端 `/hud/template` 只校验
+    「是字符串 + 截断到 300 字符」，语法对错由渲染层返回 `{error, unknown}` 给设置页
+    就地显示。理由：校验放服务端会让用户打字打到一半就被 400，而 400 的信息量远不如
+    「哪一段错了」。**胶囊侧遇到语法错误必须退回内置排版**——宁可显示老样子，也不能
+    变成空白或一段红字。模板为空字符串 / 纯空白 = 内置排版（老观感一字不变）。
+    设置页空模板时的**占位提示与预览都显示内置排版的真实文字**（由
+    `hudBuiltinSegments()` 与胶囊共用同一套分段，不另写一份），不用一段示例模板
+    当占位 —— 用户要看到的是"现在长什么样"，不是"可以写成什么样"。
+17. **`lib/client.js` 里的模板引擎是生成代码**：它不能 `import` ESM，所以由
+    `scripts/inline-hud-template.mjs` 把 `lib/hud-template.js` 的编译产物注进
+    `client.js` 的 BEGIN/END 标记之间。**改完 `src/hud-template.ts` 必须重跑内联脚本**
+    （`npm run inline:hud-template`，`build.sh` 里也接了），否则两边行为会静默分叉。
+    `scripts/smoke-hud-template-inline.mjs` 做逐字节比对 + 同一批用例对拍，专门防这个。
+18. **模板变量的口径必须与胶囊、tooltip 一致**：`hudTemplateContext()` 复用
+    `hudTotals` / `hudTightest` / `hudCalls`，不另算一套。注意两个刻意的语义差别：
+    金额（`remain*`）是**跨账号合计**（池子可累加），百分比（`pct*` / `left*`）是
+    **该窗口最紧的那个账号**（百分比不能平均，平均会盖掉"某个账号已打满"）。
+    `min()` 输出胜出参数的**原样文本**（`$0.60` 而不是 `0.6`），格式化只做一次。
+19. **百分比必须同时给「已用」和「剩余」两套**（`pct*` / `left*`）。模板语言刻意
+    没有算术，`100-pct5h` 不是合法表达式，所以「还剩百分之多少」只能由变量直接
+    给出 —— 只给 `pct*` 等于让这个需求无法表达。`left*` 必须从**同一个**
+    `hudWorstOf` / `hudTightest` 结果算 `1 - percent`，不能另取一次数据：两套
+    百分比若来自不同账号，`pctTight + leftTight` 就不等于 100%，用户会看到自相
+    矛盾的数字。`smoke-client.mjs` 里钉了这条不变量。
+20. **额度变量是一张 2×2 矩阵，不是一串平行变量**：剩余/已用 × 金额/百分比，
+    每格再分 5H / 周 / 月 / 最紧四列（`HUD_TEMPLATE_ROWS` × `HUD_TEMPLATE_COLUMNS`）。
+    设置页按矩阵渲染（grid，四列对齐），表头列名与行标题都要在 —— 位置本身就是
+    线索，少一个象限（比如「已用金额」）就等于用户表达不了那个需求。加变量时
+    **必须同时给 `group` 和 `col`**，否则矩阵里会出现空格子且列会错位；
+    `smoke-client.mjs` 校验「每行恰好四格 + 四行列顺序一致」。`remainTotal`
+    已删除：它就是「月」那一列的剩余金额，留着会让人以为是另一个口径。
 
 ## 版本兼容（最容易踩的坑）
 
@@ -143,6 +180,12 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
   `DSH_HOST_MODULES`，缺席自动跳过）。
 - 改 `lib/client.js`（HUD）：`smoke-client`（React/DOM 桩）。它是手写 bundle，
   tsc 管不到，别指望编译器帮你。
+- 改胶囊模板（`src/hud-template.ts`）：`smoke-hud-template`（语法/安全语义）+
+  `smoke-hud-template-inline`（内联块与源码一致）+
+  `smoke-hud-template-route`（真实 handler 的边界校验与落盘）+
+  `smoke-client` 的 `[3d]`/`[6]` 两节（胶囊与设置页的真实结构）。
+  只改客户端的话前三条里至少跑 `smoke-hud-template-inline`——它是唯一能发现
+  「忘了重跑内联脚本」的地方。
 - **发布前**：`bun run build && bun run typecheck && bun run smoke` 三条全绿再动
   版本号。版本号只改 `package.json`（发版由维护者 pack/publish）。
 - 修 issue 时在 commit message 里带上 issue 号与机制（现有 git log 是范例风格），

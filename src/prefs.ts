@@ -27,6 +27,25 @@ export interface CmdgoPrefsFile {
   theme?: CmdgoThemePreference
   /** 额度胶囊的位置。缺省（老文件没有这个键）= `header`（插件原有位置）。 */
   hudPosition?: CmdgoHudPosition
+  /** 胶囊自定义文字模板。缺省（老文件没有这个键 / 空串）= 内置默认排版。 */
+  hudTemplate?: string
+}
+
+/** 胶囊模板的长度上限：足够写一整行，又不至于把偏好文件撑爆。 */
+export const MAX_HUD_TEMPLATE_LENGTH = 300
+
+/**
+ * 把跨越边界的模板值收敛成可落盘的字符串。
+ *
+ * 只做三件事：非字符串→空串（= 用默认排版）、去首尾空白、截断到上限。
+ * **不校验语法** —— 模板语法错误由 `hud-template.ts` 在渲染时回报给设置页
+ * （那里要给用户看错误在哪），而不是在写盘这一层静默改写用户的输入。
+ * @param value - HTTP body 或存档里的原始值。
+ * @returns 可落盘的模板字符串；空串表示用默认排版。
+ */
+export function normalizeHudTemplate(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  return value.slice(0, MAX_HUD_TEMPLATE_LENGTH)
 }
 
 /**
@@ -94,6 +113,7 @@ function parsePrefs(raw: string): {
   hudEnabled: boolean
   theme: CmdgoThemePreference
   hudPosition: CmdgoHudPosition
+  hudTemplate: string
 } {
   const parsed: unknown = JSON.parse(raw)
   const record = (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed))
@@ -110,6 +130,8 @@ function parsePrefs(raw: string): {
     theme: isCmdgoThemePreference(record.theme) ? record.theme : DEFAULT_CMDGO_THEME,
     // 缺省为会话右上角：老文件没有这个键 → 保持插件原有位置。
     hudPosition: isCmdgoHudPosition(record.hudPosition) ? record.hudPosition : DEFAULT_CMDGO_HUD_POSITION,
+    // 缺省为空串 = 用内置默认排版（老文件没有这个键 → 外观不变）。
+    hudTemplate: normalizeHudTemplate(record.hudTemplate),
   }
 }
 
@@ -124,6 +146,7 @@ export class CmdgoPrefs {
   private hud = true
   private themeMode: CmdgoThemePreference = DEFAULT_CMDGO_THEME
   private hudPos: CmdgoHudPosition = DEFAULT_CMDGO_HUD_POSITION
+  private hudTpl = ''
   private loaded = false
   /** 进行中的加载；并发调用共享同一个 promise，避免读到半载文件。 */
   private loading: Promise<void> | undefined
@@ -159,12 +182,14 @@ export class CmdgoPrefs {
         this.hud = parsed.hudEnabled
         this.themeMode = parsed.theme
         this.hudPos = parsed.hudPosition
+        this.hudTpl = parsed.hudTemplate
       } catch (_missingOrCorrupt) {
-        // 文件不存在或损坏：用默认值（全部可见 + HUD 开 + 跟随系统 + 右上角）。
+        // 文件不存在或损坏：用默认值（全部可见 + HUD 开 + 跟随系统 + 右上角 + 默认模板）。
         this.hidden = new Set()
         this.hud = true
         this.themeMode = DEFAULT_CMDGO_THEME
         this.hudPos = DEFAULT_CMDGO_HUD_POSITION
+        this.hudTpl = ''
       }
       this.loaded = true
       this.loading = undefined
@@ -202,6 +227,7 @@ export class CmdgoPrefs {
       hudEnabled: this.hud,
       theme: this.themeMode,
       hudPosition: this.hudPos,
+      hudTemplate: this.hudTpl,
     }
     const text = JSON.stringify(payload, null, 2)
     try {
@@ -310,18 +336,39 @@ export class CmdgoPrefs {
     await this.persist()
   }
 
+  /**
+   * 设置胶囊自定义文字模板。空串 = 回到内置默认排版。
+   *
+   * 只做长度与类型收敛（`normalizeHudTemplate`）；语法对错由渲染层回报给
+   * 设置页 —— 写盘这一层不该悄悄改写用户的模板。
+   */
+  async setHudTemplate(template: string): Promise<void> {
+    await this.ensureLoaded()
+    const next = normalizeHudTemplate(template)
+    if (this.hudTpl === next) return
+    this.hudTpl = next
+    await this.persist()
+  }
+
+  /** 当前胶囊自定义模板；空串表示用内置默认排版。 */
+  get hudTemplate(): string {
+    return this.hudTpl
+  }
+
   /** 客户端可见的快照（不含任何凭据）。 */
   snapshot(): {
     hiddenModels: string[]
     hudEnabled: boolean
     theme: CmdgoThemePreference
     hudPosition: CmdgoHudPosition
+    hudTemplate: string
   } {
     return {
       hiddenModels: [...this.hidden].sort(),
       hudEnabled: this.hud,
       theme: this.themeMode,
       hudPosition: this.hudPos,
+      hudTemplate: this.hudTpl,
     }
   }
 }

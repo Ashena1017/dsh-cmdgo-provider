@@ -31,12 +31,26 @@ function render(type, props, ...children) {
   return { type, props: next }
 }
 
+/* useMemo 的缓存格。桩是单组件顺序渲染，一个格子够用。 */
+let memoCell = { deps: undefined, value: undefined }
+
 const React = {
   createElement: render,
   Fragment: 'Fragment',
   useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
-  useEffect: (fn) => { const c = fn(); if (typeof c === 'function') cleanups.push(c) },
-  useCallback: (fn) => fn,
+  useEffect: (fn) => { const c = fn(); if (typeof c === 'function') cleanups.push(c) },  useCallback: (fn) => fn,
+  /* useMemo 按依赖数组做真缓存：模板编辑器用它包住「变量表 + 渲染结果」，
+   * 桩若每次重算就看不出记忆化是否生效（依赖数组写错也测不出来）。 */
+  useMemo: (fn, deps) => {
+    if (memoCell.deps !== undefined && deps !== undefined
+      && memoCell.deps.length === deps.length
+      && memoCell.deps.every((d, i) => d === deps[i])) {
+      return memoCell.value
+    }
+    const value = fn()
+    memoCell = { deps: deps === undefined ? undefined : [...deps], value }
+    return value
+  },
   // 必须尊重初值：toggleModel 的防重入集合是 useRef(new Set())，
   // 桩若一律给 null，点到模型开关时会 TypeError（而且只在冒烟里复现）。
   useRef: (init) => ({ current: init === undefined ? null : init }),
@@ -48,8 +62,7 @@ const React = {
  * 用 `nextSnapshot` 一次性覆盖并立刻复位，避免影响其它组件的首帧断言。
  */
 let nextSnapshot = undefined
-React.useState = (init) => {
-  let value = typeof init === 'function' ? init() : init
+React.useState = (init) => {  let value = typeof init === 'function' ? init() : init
   if (value === null && nextSnapshot !== undefined) {
     value = nextSnapshot
     nextSnapshot = undefined
@@ -70,6 +83,8 @@ const status = {
   // （宿主真实 /status 一定会给；缺了整段不渲染，结构断言会直接失效）。
   models: ['zai/glm-4.6', 'kimi/k2-thinking', 'qwen/qwen3-max', 'claude-sonnet-4-5'],
   pricing: { 'zai/glm-4.6': { input: 0.435, output: 1.74, cacheRead: 0.0435 } },
+  // hudTemplate 是 0.9.x 之后新增的偏好。这里刻意**先不给**（老宿主没有这个键），
+  // 模板相关断言各自临时写值，顺带验证「缺键 → 内置排版」这条兼容路径。
   prefs: { hiddenModels: ['qwen/qwen3-max'], hudEnabled: true, theme: 'system' },
   accounts: [
     {
@@ -109,9 +124,21 @@ const status = {
 }
 
 const fetchedUrls = []
-const fakeFetch = async (url) => {
-  fetchedUrls.push(String(url))
-  if (!String(url).startsWith('/api/cmdgo/')) throw new Error('unexpected url ' + url)
+const fakeFetch = async (url, init) => {
+  const target = String(url)
+  fetchedUrls.push(target)
+  if (!target.startsWith('/api/cmdgo/')) throw new Error('unexpected url ' + url)
+  /* POST 的偏好类接口像真宿主那样**改写并回传**快照。
+     以前所有请求都返回同一份 status，于是"保存后界面是否真的跟着变"这件事
+     在冒烟里根本没走通 —— 客户端就算把返回值丢了也测不出来。 */
+  let body = null
+  try { body = init && init.body ? JSON.parse(init.body) : null } catch (e) { body = null }
+  if (target.endsWith('/hud/template') && body && typeof body.template === 'string') {
+    status.prefs.hudTemplate = body.template.slice(0, 300)
+  }
+  if (target.endsWith('/hud/toggle') && body && typeof body.enabled === 'boolean') {
+    status.prefs.hudEnabled = body.enabled
+  }
   return { ok: true, status: 200, text: async () => JSON.stringify(status) }
 }
 
@@ -404,6 +431,134 @@ console.log('[3c] 位置偏好决定渲染哪一个槽')
     pillOf(HEADER_SLOT) !== null && pillOf(COMPOSER_SLOT) === null)
 
   status.prefs.hudPosition = savedPos
+  status.prefs.hudEnabled = savedHud
+  pumpPanel(); await settleNow()
+}
+
+console.log('[3d] 胶囊自定义模板')
+{
+  const settleNow = async () => { for (let i = 0; i < 12; i += 1) await Promise.resolve() }
+  const pumpPanel = () => bySlot['shell.overlay'].component({})
+  const savedTpl = status.prefs.hudTemplate
+  const savedHud = status.prefs.hudEnabled
+  status.prefs.hudEnabled = true
+  status.prefs.hudPosition = 'header'
+  /** 取胶囊里那段自定义文字（.cmdgo-hud-custom 的内容）；没有则返回 null。 */
+  const customText = () => {
+    const node = pillOf(HEADER_SLOT)
+    if (node === null) return null
+    const kids = Array.isArray(node.props.children) ? node.props.children : [node.props.children]
+    const hit = kids.find((k) => k && k.props && String(k.props.className).includes('cmdgo-hud-custom'))
+    return hit === undefined ? null : String(hit.props.children)
+  }
+
+  // 快照里的真实数字（见上面的 status 桩）：
+  //   5H 合计 = 0.60 + 2.70 = 3.30，周 = 3.00，月 = 4 + 9 = 13.00
+  //   最紧百分比：alice 5H 80%（周 50%、月 60%），bob 最高 10% → 5H 80.0%
+  delete status.prefs.hudTemplate
+  pumpPanel(); await settleNow()
+  check('没有 hudTemplate 键（老宿主）→ 用内置排版，不出现自定义段',
+    customText() === null, String(customText()))
+
+  status.prefs.hudTemplate = ''
+  pumpPanel(); await settleNow()
+  check('空模板 → 内置排版', customText() === null)
+
+  status.prefs.hudTemplate = 'CC 剩{remainMonth}'
+  pumpPanel(); await settleNow()
+  check('模板生效：{remainMonth} 渲染成合计金额', customText() === 'CC 剩$13.00', String(customText()))
+
+  // 用户举的那个例子：跨窗口取最紧的剩余额度。
+  // 注意 {pctTight} 自带 %（百分比变量都带），模板里不要再写一个。
+  status.prefs.hudTemplate = 'CC 最紧 剩{min(remain5h, remainWeek, remainMonth)} {pctTight}可用'
+  pumpPanel(); await settleNow()
+  // min($3.30, $3.00, $13.00) → $3.00（胜出值保留自己的格式）
+  check('min() 跨窗口取最紧金额，且保留格式',
+    customText() === 'CC 最紧 剩$3.00 80.0%可用', String(customText()))
+
+  // 三个窗口各自的百分比：取各窗口里最紧的那个账号
+  status.prefs.hudTemplate = '{pct5h}/{pctWeek}/{pctMonth}'
+  pumpPanel(); await settleNow()
+  // 5H: alice 80% vs bob 10% → 80.0%；周: 只有 alice 50% → 50.0%；
+  // 月: alice 60% vs bob 10% → 60.0%
+  check('单窗口百分比取该窗口最紧的账号',
+    customText() === '80.0%/50.0%/60.0%', String(customText()))
+
+  /* 剩余百分比 = 1 − 已用百分比。模板没有算术（写不了 100-pct5h），
+   * 所以必须由变量直接给出 —— 这条守的正是"用户能表达出「还剩多少」"。 */
+  status.prefs.hudTemplate = '{left5h}/{leftWeek}/{leftMonth}'
+  pumpPanel(); await settleNow()
+  check('剩余百分比 = 1 − 已用百分比（同一账号口径）',
+    customText() === '20.0%/50.0%/40.0%', String(customText()))
+  status.prefs.hudTemplate = '{leftTight}'
+  pumpPanel(); await settleNow()
+  check('{leftTight} 与 {pctTight} 相加为 100%（最紧窗口还剩 20.0%）',
+    customText() === '20.0%', String(customText()))
+  /* 两套百分比必须来自**同一个**账号。混用口径会让「最紧」与「剩余」互相矛盾：
+   * 比如已用取最紧账号、剩余取最松账号，两行数字加起来就不是 100%。 */
+  status.prefs.hudTemplate = '{pctTight}+{leftTight}'
+  pumpPanel(); await settleNow()
+  check('最紧窗口的已用 + 剩余 = 100%（没有第二个数据源）',
+    customText() === '80.0%+20.0%', String(customText()))
+
+  // 数据缺失 → 破折号，而不是整颗胶囊消失
+  status.prefs.hudTemplate = '{calls}'
+  pumpPanel(); await settleNow()
+  check('meter 缺失时 {calls} 渲染成 —（胶囊仍在）',
+    customText() === '—' && pillOf(HEADER_SLOT) !== null, String(customText()))
+
+  // 语法错误 → 退回内置排版，胶囊不能坏
+  status.prefs.hudTemplate = '没闭合 {remainMonth'
+  pumpPanel(); await settleNow()
+  check('语法错误 → 退回内置排版（胶囊仍渲染出按钮）',
+    customText() === null && pillOf(HEADER_SLOT) !== null, String(customText()))
+
+  // 未知变量 → 渲染成 ?，看得见才改得对
+  status.prefs.hudTemplate = 'x{nope}'
+  pumpPanel(); await settleNow()
+  check('未知变量渲染成 ?', customText() === 'x?', String(customText()))
+
+  // 中文名字不是"未知变量"而是语法错误（变量名限定 ASCII 标识符）。
+  // 这条守住错误的**分类**：两类问题在设置页给的是不同的提示。
+  status.prefs.hudTemplate = 'x{剩余}'
+  pumpPanel(); await settleNow()
+  check('中文变量名算语法错误 → 退回内置排版',
+    customText() === null && pillOf(HEADER_SLOT) !== null, String(customText()))
+
+  // 模板为空字符串以外的"纯空白"也该走内置排版（否则胶囊只剩一个点）
+  status.prefs.hudTemplate = '   '
+  pumpPanel(); await settleNow()
+  check('纯空白模板 → 内置排版', customText() === null, String(customText()))
+
+  // 自定义模板不能把健康指示灯挤掉：那颗点是"能不能用"的信号，与文字无关
+  status.prefs.hudTemplate = '{window}'
+  pumpPanel(); await settleNow()
+  {
+    const node = pillOf(HEADER_SLOT)
+    const kids = Array.isArray(node.props.children) ? node.props.children : []
+    const dot = kids.find((k) => k && k.props && String(k.props.className).includes('cmdgo-hud-dot'))
+    check('自定义模板下健康指示灯仍然渲染', dot !== undefined)
+    check('自定义模板不渲染内置的 CC 标签段（文字已接管）',
+      !kids.some((k) => k && k.props && k.props.className === 'cmdgo-hud-tag'))
+  }
+
+  /* 模板属于**胶囊内容**，与放在哪个槽无关。这条守的是"别把它实现到
+   * QuotaHudSlot 里"—— 那样只有 header 档会生效，composer 档静默不认模板。 */
+  status.prefs.hudPosition = 'composer'
+  selectedProvider = 'commandcode'
+  status.prefs.hudTemplate = 'COMPOSER-{pctTight}'
+  pumpPanel(); await settleNow()
+  {
+    const node = pillOf(COMPOSER_SLOT)
+    const kids = node === null ? [] : (Array.isArray(node.props.children) ? node.props.children : [])
+    const tplSpan = kids.find((k) => k && k.props && String(k.props.className).includes('cmdgo-hud-custom'))
+    check('composer 档同样应用自定义模板',
+      tplSpan !== undefined && String(tplSpan.props.children) === 'COMPOSER-80.0%',
+      tplSpan === undefined ? '没找到自定义段' : String(tplSpan.props.children))
+  }
+  status.prefs.hudPosition = 'header'
+
+  status.prefs.hudTemplate = savedTpl
   status.prefs.hudEnabled = savedHud
   pumpPanel(); await settleNow()
 }
@@ -768,6 +923,215 @@ check('配色切换是乐观更新（先改本地再发请求），失败要回�
   && /setSnap\(before\)/.test(clientSource))
 check('固定偏好下不订阅主题事件（否则宿主每次换主题都白重渲染一次）',
   /if \(themePrefOf\(snap\) !== 'system'\) return undefined;/.test(clientSource))
+
+/* ---- 胶囊模板编辑器（设置页） ----
+ *
+ * 这一段要验的不是"有没有那个输入框"，而是三件容易做错的事：
+ *   1. 预览用的必须是**真实快照**渲染 —— 预览与胶囊不一致等于骗人；
+ *   2. 变量表的每个名字都真的能取到值（写错名字等于给了个坏按钮）；
+ *   3. 语法错误/未知变量要就地说明，而不是静默吞掉。
+ */
+console.log('[6] 设置页的模板编辑器')
+{
+  /* 期望的清单**从源码里解出来**，而不是在测试里再抄一份：
+   * 抄一份的话，加了变量却忘了同步，断言照样通过 —— 那正是这段要防的事。 */
+  const varBlock = /const HUD_TEMPLATE_VARS = \[([\s\S]*?)\n    \];/.exec(source)
+  const HUD_VAR_NAMES = varBlock === null
+    ? []
+    : [...varBlock[1].matchAll(/name: '([^']+)'/g)].map((m) => m[1])
+  const HUD_VAR_GROUPS = varBlock === null
+    ? []
+    : [...varBlock[1].matchAll(/group: '([^']+)'/g)].map((m) => m[1])
+  const HUD_VAR_COLS = varBlock === null
+    ? []
+    : [...varBlock[1].matchAll(/col: '([^']+)'/g)].map((m) => m[1])
+  const rowBlock = /const HUD_TEMPLATE_ROWS = \[([\s\S]*?)\n    \];/.exec(source)
+  const HUD_ROW_KEYS = rowBlock === null
+    ? []
+    : [...rowBlock[1].matchAll(/key: '([^']+)'/g)].map((m) => m[1])
+  const colBlock = /const HUD_TEMPLATE_COLUMNS = \[([\s\S]*?)\n    \];/.exec(source)
+  const HUD_COL_KEYS = colBlock === null
+    ? []
+    : [...colBlock[1].matchAll(/key: '([^']+)'/g)].map((m) => m[1])
+  check('从源码解出了变量清单（清单为空说明正则失效，后面的断言会假通过）',
+    HUD_VAR_NAMES.length >= 10, 'vars=' + HUD_VAR_NAMES.length)
+  check('每个变量都归到了已声明的行，矩阵变量还带一个已声明的列',
+    HUD_VAR_GROUPS.length === HUD_VAR_NAMES.length
+    && HUD_VAR_GROUPS.every((g) => g === 'other' || HUD_ROW_KEYS.indexOf(g) >= 0),
+    'groups=' + JSON.stringify(HUD_VAR_GROUPS))
+  /* 矩阵变量（非 other）必须每行 4 个、每列都有 —— 缺一格就意味着那个
+   * 「窗口 × 口径」组合用户点不到，而 2×2 矩阵的价值正在于四个象限都齐。 */
+  const matrixGroups = HUD_VAR_GROUPS.filter((g) => g !== 'other')
+  check('矩阵变量每一行都恰好四个列（窗口），没有缺格',
+    HUD_ROW_KEYS.every((row) => HUD_VAR_GROUPS.filter((g) => g === row).length === HUD_COL_KEYS.length)
+    && matrixGroups.length % HUD_COL_KEYS.length === 0,
+    'rows=' + JSON.stringify(HUD_ROW_KEYS) + ' cols=' + JSON.stringify(HUD_COL_KEYS)
+      + ' matrix=' + matrixGroups.length)
+  check('矩阵的列顺序是 5H / 周 / 月 / 最紧',
+    JSON.stringify(HUD_COL_KEYS) === JSON.stringify(['5h', 'week', 'month', 'tight']),
+    JSON.stringify(HUD_COL_KEYS))
+  check('四个象限都在：剩余金额 / 剩余百分比 / 已用金额 / 已用百分比',
+    JSON.stringify(HUD_ROW_KEYS) === JSON.stringify(['remain', 'left', 'used', 'pct']),
+    JSON.stringify(HUD_ROW_KEYS))
+  check('示例区已移除（示例属于作者仓库的文档，不该出现在 PR 里）',
+    !/HUD_TEMPLATE_PRESETS/.test(source) && !/cmdgo-tpl-presets/.test(source))
+
+  const savedTpl = status.prefs.hudTemplate
+  const renderConsole = (tpl) => {
+    if (tpl === undefined) delete status.prefs.hudTemplate
+    else status.prefs.hudTemplate = tpl
+    nextSnapshot = status
+    const node = bySlot['settings.section'].component({})
+    nextSnapshot = undefined
+    return node
+  }
+  /** 在渲染结果里按 className 找节点（浅层结构够用，编辑器是平铺的）。 */
+  const findAll = (node, cls) => {
+    const out = []
+    const go = (n) => {
+      if (n === null || n === undefined || typeof n !== 'object') return
+      if (Array.isArray(n)) { n.forEach(go); return }
+      const c = n.props && typeof n.props.className === 'string' ? n.props.className : ''
+      if (c.split(/\s+/).indexOf(cls) >= 0) out.push(n)
+      go(n.props ? n.props.children : null)
+    }
+    go(node)
+    return out
+  }
+
+  const treeDefault = renderConsole(undefined)
+  const textDefault = JSON.stringify(treeDefault)
+  check('编辑器在 HUD 区块里渲染（有标签与输入框）',
+    textDefault.includes('HUD 文字 // 自定义模板') && findAll(treeDefault, 'cmdgo-tpl-input').length === 1)
+  check('没有模板时说明当前用内置排版',
+    textDefault.includes('当前用内置排版'))
+  /* 空模板时输入框的占位提示必须是**插件原有的那套文字**，而不是一段示例
+   * 模板 —— 用户要看到的是"现在长什么样"，不是"你可以写成什么样"。
+   * 用快照里的真实数字断言，顺便验证占位与胶囊共用同一套分段。 */
+  const inputNode = findAll(treeDefault, 'cmdgo-tpl-input')[0]
+  const placeholder = inputNode === undefined ? '' : String(inputNode.props.placeholder)
+  check('空模板时占位提示显示内置排版的真实文字',
+    placeholder.startsWith('CC 5H 80.0%') && placeholder.includes('Σ$13.0'),
+    placeholder)
+  check('占位提示里不含模板语法（说明它是成品文字而不是示例模板）',
+    !/[{}]/.test(placeholder), placeholder)
+  check('预览区显示内置排版的实际文字（不是「内置排版」四个字）',
+    findAll(treeDefault, 'cmdgo-tpl-pill').length === 1
+    && JSON.stringify(findAll(treeDefault, 'cmdgo-tpl-pill')).includes('Σ$13.0'))
+  check('内置排版下不显示「恢复内置排版」按钮（没东西可恢复）',
+    !textDefault.includes('恢复内置排版'))
+
+  const treeVars = renderConsole('{pctTight}')
+  const varBtns = findAll(treeVars, 'cmdgo-var')
+  check('变量表列出了全部变量', varBtns.length === HUD_VAR_NAMES.length,
+    'got ' + varBtns.length + '/' + HUD_VAR_NAMES.length)
+  check('变量表每个条目都显示当前值（没有一个是空的）',
+    varBtns.every((b) => {
+      const span = findAll(b, 'cmdgo-var-val')
+      return span.length === 1 && String(span[0].props.children).length > 0
+    }))
+  /* 矩阵渲染：表头 + 四个数据行 + 「其他」行。每个数据行必须恰好四个芯片
+   * （缺格 = 那个「窗口 × 口径」组合点不到），且行内前缀一致（混进别的口径
+   * 说明矩阵位置错了，位置就不再是线索）。 */
+  const rowCaps = findAll(treeVars, 'cmdgo-var-cap').map((n) => String(n.props.children))
+  check('变量表是矩阵：表头 + 四行数据 + 其他',
+    JSON.stringify(rowCaps) === JSON.stringify(['', '剩余金额', '剩余百分比', '已用金额', '已用百分比', '其他']),
+    JSON.stringify(rowCaps))
+  const colCaps = findAll(treeVars, 'cmdgo-var-col').map((n) => String(n.props.children))
+  check('表头列名是 5H / 周 / 月 / 最紧',
+    JSON.stringify(colCaps) === JSON.stringify(['5H', '周', '月', '最紧']),
+    JSON.stringify(colCaps))
+  const rowSets = findAll(treeVars, 'cmdgo-var-set')
+  const perRow = rowSets.map((r) => findAll(r, 'cmdgo-var').length)
+  check('每行芯片数之和等于变量总数（矩阵不漏项）',
+    perRow.reduce((a, b) => a + b, 0) === HUD_VAR_NAMES.length,
+    JSON.stringify(perRow))
+  /* 表头那一行是列名、不含芯片，所以数据行从 index 1 开始。 */
+  check('四个数据行各四个芯片（每格都填满）',
+    perRow.slice(1, 5).every((n) => n === 4), JSON.stringify(perRow))
+  const namesInRow = (i) => findAll(rowSets[i], 'cmdgo-var')
+    .map((b) => String(findAll(b, 'cmdgo-var-name')[0].props.children))
+  check('第 1 行全是剩余金额（remain*）',
+    namesInRow(1).length === 4 && namesInRow(1).every((n) => n.startsWith('remain')),
+    JSON.stringify(namesInRow(1)))
+  check('第 2 行全是剩余百分比（left*）',
+    namesInRow(2).length === 4 && namesInRow(2).every((n) => n.startsWith('left')),
+    JSON.stringify(namesInRow(2)))
+  check('第 3 行全是已用金额（used*）—— 这是之前缺的那个象限',
+    namesInRow(3).length === 4 && namesInRow(3).every((n) => n.startsWith('used')),
+    JSON.stringify(namesInRow(3)))
+  check('第 4 行全是已用百分比（pct*）',
+    namesInRow(4).length === 4 && namesInRow(4).every((n) => n.startsWith('pct')),
+    JSON.stringify(namesInRow(4)))
+  /* 矩阵的每一列也必须同口径对齐：第 i 个芯片对应同一个窗口。
+   * 这条守的是"位置即线索"——若列错位，看第 3 列第 2 行就不等于"月剩余百分比"。 */
+  const colAligned = [1, 2, 3, 4].every((r) => {
+    const names = namesInRow(r)
+    return names.length === 4
+      && names.every((n, i) => n.endsWith(['5h', 'Week', 'Month', 'Tight'][i]))
+  })
+  check('四行的列顺序一致（5h / Week / Month / Tight 对齐成网格）', colAligned,
+    [1, 2, 3, 4].map(namesInRow).map((a) => a.join(',')).join(' | '))
+  /* 变量表在"取不到值"时必须显示 — 而不是 undefined / 空白。
+   * 前面的 [4e] 给 status 装过 meter，这里显式摘掉，否则 calls 有值、
+   * 断言测不到"缺数据"这条路径（它才是真正会出问题的那条）。 */
+  const savedMeter = status.meter
+  delete status.meter
+  const treeEmpty = renderConsole('{pctTight}')
+  const emptyVars = findAll(treeEmpty, 'cmdgo-var')
+  const callsVar = emptyVars.find((b) => JSON.stringify(b).includes('calls'))
+  check('缺 meter 时 {calls} 在变量表里显示 —',
+    callsVar !== undefined && JSON.stringify(callsVar).includes('—'),
+    JSON.stringify(callsVar))
+  check('变量表不出现 undefined / null 字样',
+    !/undefined|null/.test(JSON.stringify(emptyVars)))
+  status.meter = savedMeter
+
+  /* 没有账号时四个金额格都该是 —，不能是 $0.00。
+   * 「读到账号但额度花光」才是 $0.00；「还没读到账号」是另一件事，
+   * 显示 $0.00 会让人以为额度用尽。 */
+  const savedAccounts = status.accounts
+  status.accounts = []
+  const treeNoAcct = renderConsole('{remainMonth}')
+  const noAcctVars = findAll(treeNoAcct, 'cmdgo-var')
+  const moneyRows = ['remain5h', 'remainWeek', 'remainMonth', 'used5h', 'usedWeek', 'usedMonth']
+    .map((n) => noAcctVars.find((b) => JSON.stringify(b).includes('"' + n + '"')))
+  check('没有账号时四个金额格都显示 —（不是 $0.00）',
+    moneyRows.every((b) => b !== undefined && JSON.stringify(b).includes('—')),
+    JSON.stringify(moneyRows.map((b) => (b === undefined ? 'missing' : JSON.stringify(b)))))
+  check('没有账号时金额格里不出现 $0.00',
+    !/\$0\.00/.test(JSON.stringify(noAcctVars)),
+    JSON.stringify(noAcctVars).slice(0, 300))
+  status.accounts = savedAccounts
+
+  // 预览必须是真渲染：模板写 {remainMonth} 就要看到 $13.00（快照里的真实合计）
+  const treeReal = renderConsole('剩{remainMonth}')
+  check('预览用真实快照渲染（不是占位文字）',
+    JSON.stringify(findAll(treeReal, 'cmdgo-tpl-pill')).includes('剩$13.00'),
+    JSON.stringify(findAll(treeReal, 'cmdgo-tpl-pill')))
+  check('使用自定义模板时说明可清空恢复',
+    JSON.stringify(treeReal).includes('清空内容并保存即可恢复内置排版'))
+
+  const treeBad = renderConsole('没闭合 {remainMonth')
+  check('语法错误就地红字说明（不静默吞掉）',
+    JSON.stringify(treeBad).includes('语法错误'))
+  /* 语法错误时预览退回内置排版的实际文字，而不是半成品（`没闭合 ?`）
+   * 也不是一片空白 —— 空白会让人以为"清空就报错"。 */
+  const badPill = JSON.stringify(findAll(treeBad, 'cmdgo-tpl-pill'))
+  check('语法错误时预览不显示半成品（退回内置排版的实际文字）',
+    badPill.includes('Σ$13.0') && !badPill.includes('没闭合'), badPill)
+
+  const treeUnknown = renderConsole('{nope}')
+  check('未知变量就地列出名字',
+    JSON.stringify(treeUnknown).includes('不认识的变量') && JSON.stringify(treeUnknown).includes('nope'))
+
+  // 保存按钮：没改动时禁用（避免无意义的写盘与"点了没反应"的错觉）
+  const saveBtns = findAll(renderConsole('{pctTight}'), 'cmdgo-btn-primary')
+    .filter((b) => String(b.props.children).includes('保存模板'))
+  check('保存按钮存在，且未改动时是禁用的', saveBtns.length === 1 && saveBtns[0].props.disabled === true)
+
+  status.prefs.hudTemplate = savedTpl
+}
 
 /* 清掉注册的 effect 清理函数，避免桩里的订阅残留。 */
 cleanups.forEach((fn) => { try { fn() } catch (e) { /* 忽略 */ } })
