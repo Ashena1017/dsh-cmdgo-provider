@@ -43,7 +43,7 @@ import { CallMeter } from './meter.js'
 import type { MeterSnapshot } from './meter.js'
 import { RequestStats } from './request-stats.js'
 import type { RequestStatsView } from './request-stats.js'
-import { CmdgoPrefs, isCmdgoThemePreference, type CmdgoThemePreference } from './prefs.js'
+import { CmdgoPrefs, isCmdgoThemePreference, isCmdgoHudPosition, type CmdgoThemePreference, type CmdgoHudPosition } from './prefs.js'
 import type { GoModel } from './models.js'
 import type { ImageResolver } from './protocol.js'
 
@@ -587,7 +587,7 @@ export function apply(ctx: Context, config: Config): void {
      */
     pricing: Record<string, ModelPricing>
     /** 用户偏好：关闭的模型 + HUD 开关 + 设置页配色方案。 */
-    prefs: { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference }
+    prefs: { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference; hudPosition: CmdgoHudPosition }
   }> {
     const ref = currentRef()
     const credentials = ctx.get('credentials')
@@ -843,6 +843,19 @@ export function apply(ctx: Context, config: Config): void {
               return
             }
             await prefs.setThemePreference(body.theme)
+            sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
+            return
+          }
+          // --- 订阅胶囊位置（header = 会话右上角 / composer = 模型选择器左侧） ---
+          // 与 /theme/set 同样只存偏好；真正的槽位切换在客户端做（两个槽都注册，
+          // 由偏好决定渲染哪一个，而不是动态 register/unregister —— 后者在宿主
+          // 重启前不会生效，用户会以为没点上）。
+          if (req.method === 'POST' && action === '/hud/position') {            const body = await readJson(req)
+            if (!isCmdgoHudPosition(body.position)) {
+              sendJson(rawRes, 400, { ok: false, error: 'invalid position' })
+              return
+            }
+            await prefs.setHudPosition(body.position)
             sendJson(rawRes, 200, { ok: true, ...prefs.snapshot() })
             return
           }

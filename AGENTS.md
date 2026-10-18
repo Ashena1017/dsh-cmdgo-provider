@@ -39,7 +39,7 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
 | `src/adapter.ts` | `LlmAdapter`：流式传输、账号故障转移、历史自愈、空回合守卫 |
 | `src/index.ts` | 插件装配：settings 两代契约、供应商注册、HTTP 路由、额度 HUD 数据 |
 | `src/models.ts` | 公开目录扫描 + Go 档位两层判定 + 官方目录的费率解析 |
-| `src/prefs.ts` | 用户偏好（模型可见性黑名单 + HUD 开关 + 配色方案），落 `~/.dsh/cmdgo-prefs.json`；落盘走 `this.writing` 串行链 |
+| `src/prefs.ts` | 用户偏好（模型可见性黑名单 + HUD 开关与位置 + 配色方案），落 `~/.dsh/cmdgo-prefs.json`；落盘走 `this.writing` 串行链 |
 | `src/pool.ts` | 多账号池（round-robin / 冷却 / 收编） |
 | `src/usage.ts` / `meter.ts` / `request-stats.ts` | 额度、调用计量、缓存台账（纯只读聚合） |
 | `src/oauth.ts` | `cmd login` 的 OAuth 提取（本机回调服务器） |
@@ -87,9 +87,15 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
     未知只走 2 个 Hook、effect 写入后走 3 个，React 抛
     `Rendered more hooks than during the previous render`，**连带整块输入区渲染中断**
     （表现为模型选择器点不动），装上插件第一次加载就触发。`smoke-client.mjs` 用静态
-    断言兜底：`QuotaHudPill` 第一个 `return` 之后不允许再出现任何 `React.useXxx`。
-    桩里的 `useEffect` 是立即执行、不计数 Hook，测不出"数量变化"——这类问题只有
-    真实渲染器（react-test-renderer）或静态断言能拦。
+    断言兜底：`QuotaHudSlot` / `QuotaHudPill` 第一个 `return` 之后不允许再出现任何
+    `React.useXxx`。桩里的 `useEffect` 是立即执行、不计数 Hook，测不出"数量变化"
+    —— 这类问题只有真实渲染器（react-test-renderer）或静态断言能拦。
+13. **多个槽位靠"都注册 + 组件内判空"切换，不要动态 register/unregister**：
+    胶囊位置（`header` / `composer`）两个槽都注册，`QuotaHudSlot` 读
+    `prefs.hudPosition` 决定渲不渲染。动态注册要刷新页面才生效，用户会以为没点上；
+    而且槽注册是宿主的生命周期资源，运行时反复注册容易留下清不掉的订阅。
+    与之配套：**收起浮层的 effect 要放在槽包装里而非胶囊里** —— 胶囊可能因为门禁
+    根本不渲染，那个 effect 就永远不跑，会留一个关不掉的悬空面板。
 13. **偏好落盘必须串行**：`prefs.persist()` 是「写临时文件 + rename」两步，并发保存
     各自 rename、后完成者赢，会把用户先做的操作覆盖回去（30 次双写里稳定复现 5–10 次）。
     现在整段 read-modify-write 挂在 `this.writing` 链尾，且单个任务失败不污染后续。

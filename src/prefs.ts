@@ -25,6 +25,39 @@ export interface CmdgoPrefsFile {
   hudEnabled: boolean
   /** 设置页配色方案。缺省（老文件没有这个键）= `system`。 */
   theme?: CmdgoThemePreference
+  /** 额度胶囊的位置。缺省（老文件没有这个键）= `header`（插件原有位置）。 */
+  hudPosition?: CmdgoHudPosition
+}
+
+/**
+ * 额度胶囊的位置。
+ *
+ * - `header`：会话头部右上角工具区 —— 插件一直以来的位置，也是默认值。
+ * - `composer`：composer 工具行、模型选择器左侧 —— 0.9.4 里搬过去的，
+ *   和「当前用哪个模型」挨着读得顺，但它改变了既有用户习惯，所以做成可选项
+ *   而不是直接改默认值。
+ *
+ * ⚠️ `composer` 槽（`conversation.input.right`）只在选中本插件模型时才该占位，
+ * 否则别人的会话里也会多出一颗与当前模型无关的胶囊 —— 那需要「模型门禁」，
+ * 而门禁曾在两个 Hook 之间提前 return，让 Hook 数量随 provider 变化并直接
+ * 抛错（见 lib/client.js 里 QuotaHudPill 的注释）。这里的实现把门禁所需
+ * 状态放在 hook 之后做纯计算，不再有条件 return 穿插。
+ */
+export type CmdgoHudPosition = 'header' | 'composer'
+
+/** 可接受的胶囊位置（顺序即 UI 里两个按钮的顺序）。 */
+export const CMDGO_HUD_POSITIONS: readonly CmdgoHudPosition[] = ['header', 'composer']
+
+/** 无存档时的位置：会话右上角（插件原有行为，不改变老用户观感）。 */
+export const DEFAULT_CMDGO_HUD_POSITION: CmdgoHudPosition = 'header'
+
+/**
+ * 把一个跨越边界的值收敛成可落盘的胶囊位置。
+ * @param value - HTTP body 或存档里的原始值。
+ * @returns 合法的位置；无法识别时返回默认值。
+ */
+export function isCmdgoHudPosition(value: unknown): value is CmdgoHudPosition {
+  return typeof value === 'string' && (CMDGO_HUD_POSITIONS as readonly string[]).includes(value)
 }
 
 /**
@@ -56,7 +89,12 @@ export function isCmdgoThemePreference(value: unknown): value is CmdgoThemePrefe
 }
 
 /** 保守解析：任何意外形状都退回默认值，绝不让坏文件拖垮启动。 */
-function parsePrefs(raw: string): { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference } {
+function parsePrefs(raw: string): {
+  hiddenModels: string[]
+  hudEnabled: boolean
+  theme: CmdgoThemePreference
+  hudPosition: CmdgoHudPosition
+} {
   const parsed: unknown = JSON.parse(raw)
   const record = (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed))
     ? parsed as Record<string, unknown>
@@ -70,6 +108,8 @@ function parsePrefs(raw: string): { hiddenModels: string[]; hudEnabled: boolean;
     hudEnabled: record.hudEnabled !== false,
     // 缺省为跟随系统：老文件没有这个键 → 与宿主默认值一致。
     theme: isCmdgoThemePreference(record.theme) ? record.theme : DEFAULT_CMDGO_THEME,
+    // 缺省为会话右上角：老文件没有这个键 → 保持插件原有位置。
+    hudPosition: isCmdgoHudPosition(record.hudPosition) ? record.hudPosition : DEFAULT_CMDGO_HUD_POSITION,
   }
 }
 
@@ -83,6 +123,7 @@ export class CmdgoPrefs {
   private hidden = new Set<string>()
   private hud = true
   private themeMode: CmdgoThemePreference = DEFAULT_CMDGO_THEME
+  private hudPos: CmdgoHudPosition = DEFAULT_CMDGO_HUD_POSITION
   private loaded = false
   /** 进行中的加载；并发调用共享同一个 promise，避免读到半载文件。 */
   private loading: Promise<void> | undefined
@@ -117,11 +158,13 @@ export class CmdgoPrefs {
         this.hidden = new Set(parsed.hiddenModels)
         this.hud = parsed.hudEnabled
         this.themeMode = parsed.theme
+        this.hudPos = parsed.hudPosition
       } catch (_missingOrCorrupt) {
-        // 文件不存在或损坏：用默认值（全部可见 + HUD 开 + 跟随系统）。
+        // 文件不存在或损坏：用默认值（全部可见 + HUD 开 + 跟随系统 + 右上角）。
         this.hidden = new Set()
         this.hud = true
         this.themeMode = DEFAULT_CMDGO_THEME
+        this.hudPos = DEFAULT_CMDGO_HUD_POSITION
       }
       this.loaded = true
       this.loading = undefined
@@ -158,6 +201,7 @@ export class CmdgoPrefs {
       hiddenModels: [...this.hidden].sort(),
       hudEnabled: this.hud,
       theme: this.themeMode,
+      hudPosition: this.hudPos,
     }
     const text = JSON.stringify(payload, null, 2)
     try {
@@ -183,6 +227,11 @@ export class CmdgoPrefs {
   /** 当前配色方案偏好（`light` / `dark` / `system`）。 */
   get themePreference(): CmdgoThemePreference {
     return this.themeMode
+  }
+
+  /** 当前额度胶囊位置（`header` / `composer`）。 */
+  get hudPosition(): CmdgoHudPosition {
+    return this.hudPos
   }
 
   /** 某个模型当前是否可见。 */
@@ -251,8 +300,28 @@ export class CmdgoPrefs {
     await this.persist()
   }
 
+  /**
+   * 设置胶囊位置。校验同样在 HTTP 边界（`isCmdgoHudPosition()`），这里只写合法值。
+   */
+  async setHudPosition(position: CmdgoHudPosition): Promise<void> {
+    await this.ensureLoaded()
+    if (this.hudPos === position) return
+    this.hudPos = position
+    await this.persist()
+  }
+
   /** 客户端可见的快照（不含任何凭据）。 */
-  snapshot(): { hiddenModels: string[]; hudEnabled: boolean; theme: CmdgoThemePreference } {
-    return { hiddenModels: [...this.hidden].sort(), hudEnabled: this.hud, theme: this.themeMode }
+  snapshot(): {
+    hiddenModels: string[]
+    hudEnabled: boolean
+    theme: CmdgoThemePreference
+    hudPosition: CmdgoHudPosition
+  } {
+    return {
+      hiddenModels: [...this.hidden].sort(),
+      hudEnabled: this.hud,
+      theme: this.themeMode,
+      hudPosition: this.hudPos,
+    }
   }
 }

@@ -190,7 +190,7 @@ mod.apply({
 })
 
 console.log('[1] 槽注册')
-check('注册了 3 个条目', regs.length === 3, 'got ' + regs.length)
+check('注册了 4 个条目（设置页 + 两个胶囊槽 + 面板）', regs.length === 4, 'got ' + regs.length)
 const bySlot = Object.fromEntries(regs.map((r) => [r.def.name, r]))
 check('settings.section 存在', bySlot['settings.section'] !== undefined)
 
@@ -247,16 +247,43 @@ check('三条配色按钮都渲染出来（浅色 / 深色 / 跟随系统）',
 // 上色，跑到分区外面就会拿到别的配色。
 check('配色按钮在 .cmdgo 分区内（否则拿不到 --cmdgo-* 变量）',
   flat.some((n) => hasCls(n, 'cmdgo-seg')))
-check('胶囊挂在会话头部工具区（位置未改动）',
+check('胶囊位置两个选项都渲染出来（会话右上角 / 模型选择器左侧）',
+  consoleTree !== null
+  && ['会话右上角', '模型选择器左侧'].every((label) => JSON.stringify(consoleTree).includes(label)))
+check('胶囊位置控件是分段按钮（与配色控件同一交互语言）',
+  flat.filter((n) => hasCls(n, 'cmdgo-seg')).length >= 2,
+  '找到 ' + flat.filter((n) => hasCls(n, 'cmdgo-seg')).length + ' 组分段控件')
+/* 状态行文案要跟位置走，且 composer 档沿用胶囊固定在左侧时的那一版措辞
+ * （那里已经交代了位置和门禁，换说法会让老用户以为行为变了）。 */
+check('header 档状态行说明「会话右上角」且点明与模型无关',
+  JSON.stringify(consoleTree).includes('已显示：会话右上角显示 CommandCode Go 订阅胶囊（与当前模型无关）'))
+{
+  const savedPos = status.prefs.hudPosition
+  status.prefs.hudPosition = 'composer'
+  nextSnapshot = status
+  const composerTree = bySlot['settings.section'].component({})
+  nextSnapshot = undefined
+  check('composer 档状态行沿用原措辞（模型选择器左侧 + 门禁说明）',
+    JSON.stringify(composerTree).includes('已显示：模型选择器左侧显示 CommandCode Go 订阅胶囊（仅当选中本插件的模型时）'),
+    '没找到预期文案')
+  status.prefs.hudPosition = savedPos
+}
+check('胶囊槽：会话头部（header 档）',
   bySlot['conversation.session.header.utilities'] !== undefined
   && bySlot['conversation.session.header.utilities'].def.id === 'commandcode-go-quota')
-// 胶囊位置变更已拆出本 PR（属于使用偏好，与模型目录筛选无关）。这里把
-// "不注册到 composer 工具行"钉住，防止它被顺手搬回去 —— 搬过去就得再加
-// 模型门禁，而那个门禁曾经让 Hook 数量随 provider 变化并直接抛错。
-check('不注册到 conversation.input.right（位置变更已拆出）',
-  bySlot['conversation.input.right'] === undefined,
-  bySlot['conversation.input.right'] ? '仍然注册了 ' + bySlot['conversation.input.right'].def.id : '')
-check('胶囊不再需要 inject（没有模型门禁了）',
+// 位置做成选项后两个槽都注册，由 prefs.hudPosition 决定渲染哪一个。
+check('胶囊槽：composer（composer 档，模型选择器左侧）',
+  bySlot['conversation.input.right'] !== undefined
+  && bySlot['conversation.input.right'].def.id === 'commandcode-go-quota-inline')
+check('composer 槽带 resolveDirectory inject（模型门禁要用）',
+  bySlot['conversation.input.right'].def.inject !== undefined)
+{
+  const injected = bySlot['conversation.input.right'].def.inject('sess_test')
+  check('resolveDirectory 是函数且调用后拿到 store',
+    typeof injected.resolveDirectory === 'function'
+    && typeof injected.resolveDirectory().load === 'function')
+}
+check('header 槽不需要 inject（右上角与当前模型无关）',
   bySlot['conversation.session.header.utilities'].def.inject === undefined)
 check('shell.overlay 面板已注册',
   bySlot['shell.overlay'] !== undefined
@@ -269,10 +296,16 @@ check('面板关闭时不渲染（只做轮询）', panelEl === null)
 for (let i = 0; i < 12; i += 1) await Promise.resolve()
 
 console.log('[3] 胶囊渲染（取最紧的一条额度）')
-/** 模拟宿主：把注册项的 inject 结果并进组件的 props（现已无 inject）。 */
-const PILL_SLOT = 'conversation.session.header.utilities'
+/** 渲染某一档位置的胶囊；inject 结果按宿主行为并进 props。 */
+const HEADER_SLOT = 'conversation.session.header.utilities'
+const COMPOSER_SLOT = 'conversation.input.right'
+const pillOf = (slotName, extra) => {
+  const def = bySlot[slotName].def
+  const injected = typeof def.inject === 'function' ? def.inject('sess_test') : {}
+  return bySlot[slotName].component({ ...injected, ...(extra || {}) })
+}
 const pillProps = (extra) => ({ ...(extra || {}) })
-const pill = bySlot[PILL_SLOT].component(pillProps())
+const pill = pillOf(HEADER_SLOT)
 check('胶囊渲染出按钮', pill !== null && pill.type === 'button')
 const pillText = JSON.stringify(pill)
 check('胶囊含账号数 ×2', pillText.includes('\u00d72'))
@@ -283,17 +316,19 @@ console.log('[3a] 胶囊的 Hook 顺序必须与 provider / 快照无关')
  * 首帧 provider 未知只走 2 个 Hook、effect 写入后走 3 个，React 抛
  * 「Rendered more hooks than during the previous render」，连带整块输入区
  * 渲染中断。桩里的 useEffect 是立即执行、且没有 Hook 计数，测不出"数量变化"，
- * 所以这里改成**静态断言**：QuotaHudPill 里第一个 return 之前不允许出现
+ * 所以这里改成**静态断言**：两个胶囊相关组件里第一个 return 之前不允许出现
  * 任何后续 React.useXxx 调用。 */
 {
-  const src = source.slice(source.indexOf('function QuotaHudPill'))
-  const body = src.slice(0, src.indexOf('\n    }'))
-  const firstReturn = body.search(/\n\s*(if \([^\n]*\) )?return /)
-  const afterReturn = firstReturn >= 0 ? body.slice(firstReturn) : ''
-  const hookAfter = [...afterReturn.matchAll(/React\.use[A-Z]\w*/g)].map((m) => m[0])
-  check('QuotaHudPill 第一个 return 之后没有任何 Hook 调用',
-    firstReturn >= 0 && hookAfter.length === 0,
-    'firstReturn=' + firstReturn + ' 之后的 Hook: ' + JSON.stringify(hookAfter))
+  for (const fn of ['QuotaHudSlot', 'QuotaHudPill']) {
+    const src = source.slice(source.indexOf('function ' + fn))
+    const body = src.slice(0, src.indexOf('\n    }'))
+    const firstReturn = body.search(/\n\s*(if \([^\n]*\) )?return /)
+    const afterReturn = firstReturn >= 0 ? body.slice(firstReturn) : ''
+    const hookAfter = [...afterReturn.matchAll(/React\.use[A-Z]\w*/g)].map((m) => m[0])
+    check(fn + ' 第一个 return 之后没有任何 Hook 调用',
+      firstReturn >= 0 && hookAfter.length === 0,
+      'firstReturn=' + firstReturn + ' 之后的 Hook: ' + JSON.stringify(hookAfter))
+  }
 }
 
 console.log('[3b] HUD 隐藏开关作用于胶囊')
@@ -307,18 +342,70 @@ console.log('[3b] HUD 隐藏开关作用于胶囊')
   status.prefs.hudEnabled = false
   pumpPanel()
   await settleNow()
-  const hiddenPill = bySlot[PILL_SLOT].component(pillProps())
+  const hiddenPill = pillOf(HEADER_SLOT)
   check('hudEnabled=false → 胶囊不渲染', hiddenPill === null, '竟然是 ' + JSON.stringify(hiddenPill))
 
   status.prefs.hudEnabled = true
   pumpPanel()
   await settleNow()
-  const shownPill = bySlot[PILL_SLOT].component(pillProps())
+  const shownPill = pillOf(HEADER_SLOT)
   check('hudEnabled=true → 胶囊恢复', shownPill !== null && shownPill.type === 'button')
 
   status.prefs.hudEnabled = saved
   pumpPanel()
   await settleNow()
+}
+
+console.log('[3c] 位置偏好决定渲染哪一个槽')
+{
+  const settleNow = async () => { for (let i = 0; i < 12; i += 1) await Promise.resolve() }
+  const pumpPanel = () => bySlot['shell.overlay'].component({})
+  const savedPos = status.prefs.hudPosition
+  const savedHud = status.prefs.hudEnabled
+  status.prefs.hudEnabled = true
+
+  // 默认（没有该字段）= header
+  delete status.prefs.hudPosition
+  pumpPanel(); await settleNow()
+  check('缺字段 → 默认 header 档显示',
+    pillOf(HEADER_SLOT) !== null && pillOf(COMPOSER_SLOT) === null)
+
+  // header 档
+  status.prefs.hudPosition = 'header'
+  pumpPanel(); await settleNow()
+  check('header 档：头部渲染、模型选择器左侧不渲染',
+    pillOf(HEADER_SLOT) !== null && pillOf(COMPOSER_SLOT) === null)
+
+  // composer 档 + 选中本插件 → 只渲染 composer
+  selectedProvider = 'commandcode'
+  status.prefs.hudPosition = 'composer'
+  pumpPanel(); await settleNow()
+  check('composer 档 + 选中本插件：只在模型选择器左侧渲染',
+    pillOf(HEADER_SLOT) === null && pillOf(COMPOSER_SLOT) !== null)
+
+  // composer 档 + 选中别的 provider → 两档都不渲染（门禁）
+  selectedProvider = 'deepseek-account'
+  pumpPanel(); await settleNow()
+  check('composer 档 + 选中别的 provider：两档都不渲染（门禁生效）',
+    pillOf(HEADER_SLOT) === null && pillOf(COMPOSER_SLOT) === null)
+
+  // header 档 + 选中别的 provider → 仍然渲染（右上角与当前模型无关）
+  selectedProvider = 'deepseek-account'
+  status.prefs.hudPosition = 'header'
+  pumpPanel(); await settleNow()
+  check('header 档 + 选中别的 provider：仍然渲染（不受门禁影响）',
+    pillOf(HEADER_SLOT) !== null)
+
+  // 脏值 → 退回 header
+  selectedProvider = 'commandcode'
+  status.prefs.hudPosition = 'somewhere-else'
+  pumpPanel(); await settleNow()
+  check('脏位置值 → 退回 header 档',
+    pillOf(HEADER_SLOT) !== null && pillOf(COMPOSER_SLOT) === null)
+
+  status.prefs.hudPosition = savedPos
+  status.prefs.hudEnabled = savedHud
+  pumpPanel(); await settleNow()
 }
 
 console.log('[4] 面板渲染（多账号逐条额度）')
@@ -373,7 +460,7 @@ check('给出 5H 窗口内次数 3.3/0.05 = 66', t4e.includes('5H 窗口内 ≈ 
 check('标注实测单价与样本数', t4e.includes('$0.05/次') && t4e.includes('样本 39 次调用'))
 
 console.log('[4f] 胶囊同步显示合计与次数')
-const pillReady = bySlot[PILL_SLOT].component({})
+const pillReady = pillOf(HEADER_SLOT)
 const t4f = JSON.stringify(pillReady)
 check('胶囊含合计 Σ$13.0', t4f.includes('Σ$13.0'), t4f)
 check('胶囊含 ≈260次', t4f.includes('≈260次'))
@@ -399,7 +486,7 @@ status.accounts[0].usage.weekly = savedWeekly
 
 console.log('[4h] 缓存台账（issue #6 补充诉求）')
 // 会话头部的胶囊会把 sessionId 写进共享 store，面板据此带 ?sessionId= 拉本会话台账。
-const pillSession = bySlot[PILL_SLOT].component(pillProps({ sessionId: 'sess_xyz' }))
+const pillSession = pillOf(HEADER_SLOT, { sessionId: 'sess_xyz' })
 const t4hPill = JSON.stringify(pillSession)
 // 胶囊里那个紧凑指示器：一个 cmdgo-hud-num span，文案以命中率结尾（箭头字符不写死）。
 const compactCache = Array.isArray(pillSession.props.children)
