@@ -1033,8 +1033,11 @@ console.log('[6] 设置页的模板编辑器')
   check('矩阵的列顺序是 5H / 周 / 月 / 最紧',
     JSON.stringify(HUD_COL_KEYS) === JSON.stringify(['5h', 'week', 'month', 'tight']),
     JSON.stringify(HUD_COL_KEYS))
-  check('四个象限都在：剩余金额 / 剩余百分比 / 已用金额 / 已用百分比',
-    JSON.stringify(HUD_ROW_KEYS) === JSON.stringify(['remain', 'left', 'used', 'pct']),
+  /* 行顺序是排版决定，不是随手排的：前四行是「剩余/已用 × 金额/百分比」的
+   * 2×2 象限（那是宿主直接给的原始数据），总额是「剩余 + 已用」推出来的汇总，
+   * 放最后 —— 混在中间会让人以为它也是并列的原始一档。 */
+  check('四个象限 + 总额：剩余金额 / 剩余百分比 / 已用金额 / 已用百分比 / 总金额',
+    JSON.stringify(HUD_ROW_KEYS) === JSON.stringify(['remain', 'left', 'used', 'pct', 'total']),
     JSON.stringify(HUD_ROW_KEYS))
   check('示例区已移除（示例属于作者仓库的文档，不该出现在 PR 里）',
     !/HUD_TEMPLATE_PRESETS/.test(source) && !/cmdgo-tpl-presets/.test(source))
@@ -1097,8 +1100,8 @@ console.log('[6] 设置页的模板编辑器')
    * （缺格 = 那个「窗口 × 口径」组合点不到），且行内前缀一致（混进别的口径
    * 说明矩阵位置错了，位置就不再是线索）。 */
   const rowCaps = findAll(treeVars, 'cmdgo-var-cap').map((n) => String(n.props.children))
-  check('变量表是矩阵：表头 + 四行数据 + 其他',
-    JSON.stringify(rowCaps) === JSON.stringify(['', '剩余金额', '剩余百分比', '已用金额', '已用百分比', '其他']),
+  check('变量表是矩阵：表头 + 五行数据 + 其他',
+    JSON.stringify(rowCaps) === JSON.stringify(['', '剩余金额', '剩余百分比', '已用金额', '已用百分比', '总金额', '其他']),
     JSON.stringify(rowCaps))
   const colCaps = findAll(treeVars, 'cmdgo-var-col').map((n) => String(n.props.children))
   check('表头列名是 5H / 周 / 月 / 最紧',
@@ -1157,15 +1160,61 @@ console.log('[6] 设置页的模板编辑器')
   status.accounts = []
   const treeNoAcct = renderConsole('{remainMonth}')
   const noAcctVars = findAll(treeNoAcct, 'cmdgo-var')
-  const moneyRows = ['remain5h', 'remainWeek', 'remainMonth', 'used5h', 'usedWeek', 'usedMonth']
+  const moneyRows = ['remain5h', 'remainWeek', 'remainMonth', 'used5h', 'usedWeek', 'usedMonth',
+    'total5h', 'totalWeek', 'totalMonth']
     .map((n) => noAcctVars.find((b) => JSON.stringify(b).includes('"' + n + '"')))
-  check('没有账号时四个金额格都显示 —（不是 $0.00）',
+  check('没有账号时金额格都显示 —（不是 $0.00）',
     moneyRows.every((b) => b !== undefined && JSON.stringify(b).includes('—')),
     JSON.stringify(moneyRows.map((b) => (b === undefined ? 'missing' : JSON.stringify(b)))))
   check('没有账号时金额格里不出现 $0.00',
     !/\$0\.00/.test(JSON.stringify(noAcctVars)),
     JSON.stringify(noAcctVars).slice(0, 300))
   status.accounts = savedAccounts
+
+  /* 总金额 = 剩余 + 已用。这条不能只靠「看起来对」：用户在设置页会拿计算器核对
+   * 这一列，差一分钱就说明两处口径不同源（cap 与 used 各自取整就会这样）。
+   * 四列一起核对，连同「最紧」那一格（它取的是那条记录自己的窗口，不是合计）。 */
+  const treeTotals = renderConsole('{totalMonth}')
+  const totVars = findAll(treeTotals, 'cmdgo-var')
+  const varText = (name) => {
+    const b = totVars.find((x) => JSON.stringify(x).includes('"' + name + '"'))
+    if (b === undefined) return 'missing'
+    const v = findAll(b, 'cmdgo-var-val')[0]
+    return v === undefined ? 'missing' : String(v.props.children)
+  }
+  const moneyNum = (text) => Number(String(text).replace(/[^0-9.]/g, ''))
+  const columnSums = [
+    ['5h', 'total5h', 'remain5h', 'used5h'],
+    ['周', 'totalWeek', 'remainWeek', 'usedWeek'],
+    ['月', 'totalMonth', 'remainMonth', 'usedMonth'],
+    ['最紧', 'totalTight', 'remainTight', 'usedTight'],
+  ].map(([label, t, r, u]) => ({
+    label, total: moneyNum(varText(t)), remain: moneyNum(varText(r)), used: moneyNum(varText(u)),
+  }))
+  check('总金额 = 剩余金额 + 已用金额（四列逐一核对）',
+    columnSums.every((c) => Math.abs(c.total - (c.remain + c.used)) < 1e-9),
+    JSON.stringify(columnSums))
+  check('总金额的具体数值：5H $6.00 / 周 $6.00 / 月 $20.00 / 最紧 $3.00',
+    varText('total5h') === '$6.00' && varText('totalWeek') === '$6.00'
+    && varText('totalMonth') === '$20.00' && varText('totalTight') === '$3.00',
+    JSON.stringify([varText('total5h'), varText('totalWeek'), varText('totalMonth'), varText('totalTight')]))
+  /* 宿主报不出 used 时（认不出套餐），总额也不能编：只报 remaining 的方案里
+   * 「总额 = 剩余」是错的，宁可不显示 —。这里把所有账号的 used/total 都摘掉，
+   * 模拟"一个都认不出套餐"；只摘一个的话合计仍会落在一个偏小的值上。 */
+  const savedTotalAccounts = status.accounts
+  status.accounts = savedTotalAccounts.map((a) => ({
+    ...a,
+    usage: { ...a.usage, monthly: { ...a.usage.monthly } },
+  }))
+  status.accounts.forEach((a) => {
+    delete a.usage.monthly.used
+    delete a.usage.monthly.total
+  })
+  const noTotalVars = findAll(renderConsole('{totalMonth}'), 'cmdgo-var')
+  check('宿主认不出套餐（没有 used/total）时总额显示 —（不拿剩余冒充总额）',
+    String(JSON.stringify(noTotalVars.find((b) => JSON.stringify(b).includes('"totalMonth"')))).includes('—'),
+    JSON.stringify(noTotalVars.find((b) => JSON.stringify(b).includes('"totalMonth"'))))
+  status.accounts = savedTotalAccounts
 
   // 预览必须是真渲染：模板写 {remainMonth} 就要看到 $13.00（快照里的真实合计）
   const treeReal = renderConsole('剩{remainMonth}')

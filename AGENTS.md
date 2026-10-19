@@ -141,6 +141,10 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
     **必须同时给 `group` 和 `col`**，否则矩阵里会出现空格子且列会错位；
     `smoke-client.mjs` 校验「每行恰好四格 + 四行列顺序一致」。`remainTotal`
     已删除：它就是「月」那一列的剩余金额，留着会让人以为是另一个口径。
+    **`total*`（总金额）排在最后一行**，它是 `剩余 + 已用` 推出来的汇总，不是
+    宿主直接给的原始一档；也必须与同一列的 `remain*` / `used*` **同源相加**
+    （见 `hudTotalsTotal`），否则用户拿计算器核对会发现差一分钱。宿主认不出
+    套餐（报不出 `used`）时整列给 `—`，不能拿「剩余」冒充「总额」。
 21. **浮层的展开位置必须跟着胶囊走**：胶囊有两档槽（会话头部 / composer），
     面板只有一个 `shell.overlay`。头部档用 CSS 钉右上角没问题，composer 档必须
     **量胶囊的 `getBoundingClientRect()` 再定位**，否则用户点屏幕底部的胶囊、
