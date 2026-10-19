@@ -472,6 +472,27 @@ console.log('[3d] 胶囊自定义模板')
   pumpPanel(); await settleNow()
   check('模板生效：{remainMonth} 渲染成合计金额', customText() === 'CC 剩$13.00', String(customText()))
 
+  /* 连续空格必须原样保留。
+   *
+   * 两个地方会吃掉空格，这里各钉一条：
+   *   1. 渲染层 trim —— 早期实现先 trim() 再渲染，首尾空格没了，而设置页预览
+   *      渲染的是原始文本，预览和胶囊会差几个空格；
+   *   2. CSS 折叠 —— 胶囊是 white-space:nowrap，normal/nowrap 会把连续空白
+   *      折叠成一个，所以模板段必须用 white-space:pre（下面 [5] 里有断言）。 */
+  status.prefs.hudTemplate = 'CC   5H'
+  pumpPanel(); await settleNow()
+  check('模板里的连续空格不被折叠成单个', customText() === 'CC   5H', JSON.stringify(customText()))
+  status.prefs.hudTemplate = '  CC {pct5h}'
+  pumpPanel(); await settleNow()
+  check('模板首部空格也保留（与设置页预览一致，不偷偷 trim）',
+    customText() === '  CC 80.0%', JSON.stringify(customText()))
+  // 全是空白 = 空模板 → 内置排版，不能只显示一个健康点。
+  status.prefs.hudTemplate = '   '
+  pumpPanel(); await settleNow()
+  check('全是空白的模板按空模板处理（退回内置排版）',
+    customText() === null && String(JSON.stringify(pillOf(HEADER_SLOT))).includes('Σ$13.0'),
+    JSON.stringify(customText()))
+
   // 用户举的那个例子：跨窗口取最紧的剩余额度。
   // 注意 {pctTight} 自带 %（百分比变量都带），模板里不要再写一个。
   status.prefs.hudTemplate = 'CC 最紧 剩{min(remain5h, remainWeek, remainMonth)} {pctTight}可用'
@@ -724,6 +745,20 @@ check('HUD 样式独立注入且含主题变量',
   'style id missing')
 check('设置页 .cmdgo-* 基础样式一并注入（面板复用 QuotaBlock）',
   (styleNodes.get('cmdgo-console-style') || {}).textContent?.includes('.cmdgo-qrow') === true)
+/* 自定义模板那一段必须 white-space:pre。
+ *
+ * 胶囊外层是 nowrap，而 normal/nowrap 都会把连续空白**折叠成一个空格** ——
+ * 用户写「CC  5H」做对齐，渲染出来只剩一格。这条只能靠 CSS 断言守：
+ * 冒烟拿到的是 props，不是布局，折叠发生在渲染引擎里。
+ *
+ * 规则在 cmdgo-console-style 里（胶囊是 ensureHudStyle → ensureStyle 的链路，
+ * 两套样式永远同时在场），所以这里把两份拼起来找，别绑死在哪一个 style 标签上。 */
+const allInjectedCss = ['cmdgo-hud-style', 'cmdgo-console-style']
+  .map((id) => (styleNodes.get(id) || {}).textContent || '').join('\n')
+const customRule = /\.cmdgo-hud-custom\{([^}]*)\}/.exec(allInjectedCss)
+check('模板段 white-space:pre（否则连续空格被折叠成一个）',
+  customRule !== null && /white-space:\s*pre\b/.test(customRule[1]),
+  customRule === null ? '找不到 .cmdgo-hud-custom 规则' : customRule[1])
 /* composer 槽里那颗胶囊要整体下移，和模型选择器对齐。
  *
  * 这条断言守的是一个**只能靠肉眼发现**的偏移：宿主那行是 flex+align-items:center，
