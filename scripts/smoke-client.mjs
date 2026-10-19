@@ -688,24 +688,31 @@ check('HUD 样式独立注入且含主题变量',
   'style id missing')
 check('设置页 .cmdgo-* 基础样式一并注入（面板复用 QuotaBlock）',
   (styleNodes.get('cmdgo-console-style') || {}).textContent?.includes('.cmdgo-qrow') === true)
-/* composer 槽里那颗胶囊要把文字整体下移，和模型选择器对齐。
+/* composer 槽里那颗胶囊要整体下移，和模型选择器对齐。
  *
  * 这条断言守的是一个**只能靠肉眼发现**的偏移：宿主那行是 flex+align-items:center，
- * 两边的盒子中心一定重合，所以「盒子没对齐」这种错误在 DOM 层面根本看不出来；
- * 偏移来自文字——胶囊里全是大写/数字（没有下伸部），标签里却有 g 和括号。
- * 用户报过一次「胶囊看起来偏上」，改法只能是挪文字，不能挪胶囊（挪胶囊会让它相对
- * 左边的 ⊕ 和右边的发送键偏下）。因此这里锁三件事：
- *   1) 规则存在且带 padding-top；
+ * 两边的盒子中心一定重合，所以「盒子没对齐」这种错误在 DOM 层面根本看不出来。
+ * 偏移来自宿主标签的墨迹——「DeepSeek V4.1 Flash (latest) High」的 g 和括号把墨迹
+ * 往下拖了约 2.5px（设备像素），而我们胶囊里全是大写/数字。
+ *
+ * 用户报过两次「胶囊偏上」。第一版只挪文字（padding-top），文字对上了、框还留在
+ * 行心，变成「框比自己的字高 2px」，所以改成整颗平移。这里锁三件事：
+ *   1) 规则存在且用 position+top 做整体平移（不是 padding，那只会挪字）；
  *   2) 它被 [data-slot] 限定住 —— 会话头部的胶囊旁边是会话标题（字号完全不同），
  *      设置页预览里也没有 data-slot，两边都不该跟着动；
- *   3) 基础 .cmdgo-hud-pill 的 padding 仍是 0，证明下移没有泄漏到别处。 */
+ *   3) 基础 .cmdgo-hud-pill 的 padding 仍是 0，证明平移没有泄漏到别处。 */
 const hudCssText = (styleNodes.get('cmdgo-hud-style') || {}).textContent || ''
 const composerNudge = /\[data-slot="conversation\.input\.right"\]\s*\.cmdgo-hud-pill\{([^}]*)\}/.exec(hudCssText)
-check('composer 槽的胶囊带基线对齐补偿（否则文字比模型选择器高约 1.7px）',
-  composerNudge !== null && /padding-top:\s*[0-9.]+px/.test(composerNudge[1]),
+check('composer 槽的胶囊整体下移（否则比模型选择器高约 2.5px）',
+  composerNudge !== null
+  && /position:\s*relative/.test(composerNudge[1])
+  && /\btop:\s*[0-9.]+px/.test(composerNudge[1]),
   composerNudge === null ? '找不到 [data-slot="conversation.input.right"] .cmdgo-hud-pill' : composerNudge[1])
+check('平移不能用 padding-top 实现（那只会挪文字，框仍留在行心）',
+  composerNudge !== null && !/padding/.test(composerNudge[1]),
+  composerNudge === null ? '规则缺失' : composerNudge[1])
 const basePillRule = /\.cmdgo-hud-pill\{([^}]*)\}/.exec(hudCssText)
-check('基线补偿只作用于 composer 槽（基础 .cmdgo-hud-pill 仍是 padding:0 9px）',
+check('对齐补偿只作用于 composer 槽（基础 .cmdgo-hud-pill 仍是 padding:0 9px）',
   basePillRule !== null && /padding:0 9px/.test(basePillRule[1]),
   basePillRule === null ? '找不到基础 .cmdgo-hud-pill 规则' : basePillRule[1])
 /* 原生控件的配色锚点。
