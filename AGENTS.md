@@ -141,6 +141,14 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
     **必须同时给 `group` 和 `col`**，否则矩阵里会出现空格子且列会错位；
     `smoke-client.mjs` 校验「每行恰好四格 + 四行列顺序一致」。`remainTotal`
     已删除：它就是「月」那一列的剩余金额，留着会让人以为是另一个口径。
+21. **浮层的展开位置必须跟着胶囊走**：胶囊有两档槽（会话头部 / composer），
+    面板只有一个 `shell.overlay`。头部档用 CSS 钉右上角没问题，composer 档必须
+    **量胶囊的 `getBoundingClientRect()` 再定位**，否则用户点屏幕底部的胶囊、
+    面板从屏幕顶部落下来，中间隔着整个会话（已报障两次）。定位用
+    `translateY(-100%)` 把下沿贴到胶囊上方，不要自己算面板高度（高度随账号数变）；
+    `max-height` 取「胶囊上方剩余空间」，量不到胶囊就退回右上角而不是钉到 (0,0)。
+    几何抽在纯函数 `hudPanelAnchorStyle(anchor, vw)` 里，`smoke-client.mjs` 的
+    `[4i]` 直接调它断言（冒烟桩没有布局引擎，只能这么测）。
 
 ## 版本兼容（最容易踩的坑）
 

@@ -15,7 +15,11 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
+/* 加载前把「浮层锚定的纯几何函数」挂到 exports 上，断言才能直接调它。
+   不写进生产导出：这是测试专用的探针，加进 client 的公开契约会误导插件作者。
+   替换目标找不到时 __probe 为 undefined，下面的断言会直接报红，不会静默跳过。 */
 const source = readFileSync(join(here, '..', 'lib', 'client.js'), 'utf8')
+  .replace(/(\n\s*)return module\.exports;/, '$1module.exports.__probe = { hudPanelAnchorStyle };$1return module.exports;')
 
 /* ---------------- 桩：React ---------------- */
 
@@ -681,6 +685,38 @@ await settle()
 const t4hNoCache = JSON.stringify(renderPanel())
 check('网关未报缓存字段时如实说明', t4hNoCache.includes('网关未报缓存字段'), t4hNoCache.slice(t4hNoCache.indexOf('最近一次'), t4hNoCache.indexOf('最近一次') + 120))
 status.cache = savedCache
+
+console.log('[4i] 浮层锚定几何')
+/* 胶囊搬到 composer 之后，浮层必须贴着胶囊往上弹，不能还钉在右上角。
+ *
+ * 这段几何在 DOM 里最难验：偏 8px 肉眼分不清，被视口切掉一半却很明显，而冒烟桩
+ * 没有布局引擎。所以把它抽成纯函数 hudPanelAnchorStyle(anchor, vw) 直接调。 */
+const probe = mod.__probe
+check('锚定函数可被测试（源码探针注入成功）', probe !== undefined && typeof probe.hudPanelAnchorStyle === 'function',
+  'client.js 里找不到 return module.exports; —— 探针注入失败')
+if (probe !== undefined && typeof probe.hudPanelAnchorStyle === 'function') {
+  const st = probe.hudPanelAnchorStyle
+  check('头部档不锚定（保留 CSS 的右上角）', st(undefined, 1400) === undefined && st(null, 1400) === undefined,
+    JSON.stringify(st(undefined, 1400)))
+  const a = st({ top: 1120, right: 1410 }, 1400)
+  check('锚定时面板下沿落在胶囊上方 8px',
+    a !== undefined && a.top === '1112px', a && a.top)
+  check('锚定时面板右边缘跟胶囊右对齐（换算成 right）',
+    a !== undefined && a.right === '8px', a && a.right)
+  check('锚定时用 transform 上翻，不自己算面板高度',
+    a !== undefined && a.transform === 'translateY(-100%)', a && a.transform)
+  check('锚定时显式清掉 left/bottom（否则和 CSS 的半锚定打架）',
+    a !== undefined && a.left === 'auto' && a.bottom === 'auto', a && JSON.stringify([a.left, a.bottom]))
+  check('顶到视口右外时 right 不小于 8px',
+    st({ top: 900, right: 4000 }, 1400).right === '8px', st({ top: 900, right: 4000 }, 1400).right)
+  check('短窗口下 max-height 兜底 180px（不压成一条缝）',
+    st({ top: 120, right: 1400 }, 1400).maxHeight === '180px', st({ top: 120, right: 1400 }, 1400).maxHeight)
+  check('拿不到视口宽度时退回 right:16px，不产出 NaN',
+    st({ top: 900, right: 1400 }, 0).right === '16px', st({ top: 900, right: 1400 }, 0).right)
+  check('锚点缺字段一律不锚定（脏数据不产出半锚定样式）',
+    st({ top: undefined, right: 1400 }, 1400) === undefined
+    && st({ top: 900, right: NaN }, 1400) === undefined)
+}
 
 console.log('[5] 样式注入')
 check('HUD 样式独立注入且含主题变量',
