@@ -153,6 +153,13 @@ DSH_CHECKOUT=/path/to/host/node_modules/.. bun run build
     `max-height` 取「胶囊上方剩余空间」，量不到胶囊就退回右上角而不是钉到 (0,0)。
     几何抽在纯函数 `hudPanelAnchorStyle(anchor, vw)` 里，`smoke-client.mjs` 的
     `[4i]` 直接调它断言（冒烟桩没有布局引擎，只能这么测）。
+22. **变量芯片必须插到光标处，不能追加到末尾**：点芯片是一次 `mousedown`，
+    浏览器默认会在 mousedown 里把焦点从输入框挪到按钮上 —— 焦点一走，
+    `document.activeElement !== input`，而 `selectionStart` 读到的位置就不再是
+    用户刚点的那个地方（早期实现据此判"没有光标"，于是每次都追加到末尾，已报障）。
+    两头都要做：芯片 `onMouseDown` **阻止默认行为**保住焦点，再用
+    `caretRef` 记住最后一次选区兜底。插入几何抽在纯函数 `hudInsertAtCaret`
+    里（`smoke-client.mjs` 的 `[6]` 直接调），越界 / 倒序选区在那里归一。
 
 ## 版本兼容（最容易踩的坑）
 

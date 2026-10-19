@@ -19,7 +19,7 @@ const here = dirname(fileURLToPath(import.meta.url))
    不写进生产导出：这是测试专用的探针，加进 client 的公开契约会误导插件作者。
    替换目标找不到时 __probe 为 undefined，下面的断言会直接报红，不会静默跳过。 */
 const source = readFileSync(join(here, '..', 'lib', 'client.js'), 'utf8')
-  .replace(/(\n\s*)return module\.exports;/, '$1module.exports.__probe = { hudPanelAnchorStyle };$1return module.exports;')
+  .replace(/(\n\s*)return module\.exports;/, '$1module.exports.__probe = { hudPanelAnchorStyle, hudInsertAtCaret };$1return module.exports;')
 
 /* ---------------- 桩：React ---------------- */
 
@@ -1096,6 +1096,40 @@ console.log('[6] 设置页的模板编辑器')
       const span = findAll(b, 'cmdgo-var-val')
       return span.length === 1 && String(span[0].props.children).length > 0
     }))
+  /* 点芯片必须插到**光标处**，不是末尾。
+   *
+   * 这条守的是一个真实报障：点芯片是一次 mousedown，浏览器默认借 mousedown
+   * 把焦点从输入框挪到按钮上，于是 document.activeElement 不再是输入框，
+   * 早期实现据此判定"没有光标信息"，每次都追加到末尾。
+   * 冒烟桩没有 DOM，所以两头分开验：
+   *   1. 插入几何抽成纯函数 hudInsertAtCaret，直接测；
+   *   2. 芯片的 onMouseDown 必须阻止默认行为（否则焦点还是会跑）。 */
+  const insertAt = mod.__probe && mod.__probe.hudInsertAtCaret
+  check('插入几何函数可被测试（源码探针注入成功）', typeof insertAt === 'function')
+  if (typeof insertAt === 'function') {
+    const mid = insertAt('CC 可用', '${pctTight}', { start: 3, end: 3 })
+    check('插到光标处而不是末尾', mid.next === 'CC ${pctTight}可用', mid.next)
+    check('插入后光标落在变量名之后（连点才顺手）', mid.caret === 3 + '${pctTight}'.length, String(mid.caret))
+    const replaced = insertAt('abcdef', 'X', { start: 2, end: 4 })
+    check('选中一段再插是替换，不是并排躺两个', replaced.next === 'abXef', replaced.next)
+    const appended = insertAt('abc', 'Y', null)
+    check('拿不到选区才追加到末尾', appended.next === 'abcY' && appended.caret === 4, JSON.stringify(appended))
+    check('越界选区夹到文本长度内', insertAt('abc', 'Z', { start: 99, end: 99 }).next === 'abcZ')
+    check('倒序选区按落点插入（不误删中间那段）',
+      insertAt('abc', 'Z', { start: 2, end: 0 }).next === 'abZc',
+      insertAt('abc', 'Z', { start: 2, end: 0 }).next)
+    check('空文本也能插', insertAt('', '${a}', { start: 0, end: 0 }).next === '${a}')
+  }
+  const chipNode = varBtns[0]
+  let prevented = false
+  const chipMouseDown = chipNode && chipNode.props.onMouseDown
+  if (typeof chipMouseDown === 'function') chipMouseDown({ preventDefault: () => { prevented = true } })
+  check('芯片 onMouseDown 阻止默认行为（否则焦点被抢、选区丢失）', prevented === true,
+    typeof chipMouseDown)
+  check('芯片提示写明「插入到光标处」',
+    String(chipNode && chipNode.props.title).includes('插入到光标处'),
+    String(chipNode && chipNode.props.title))
+
   /* 矩阵渲染：表头 + 四个数据行 + 「其他」行。每个数据行必须恰好四个芯片
    * （缺格 = 那个「窗口 × 口径」组合点不到），且行内前缀一致（混进别的口径
    * 说明矩阵位置错了，位置就不再是线索）。 */
